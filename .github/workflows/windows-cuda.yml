@@ -6,6 +6,10 @@ jobs:
   build-windows:
     runs-on: windows-2019
 
+    defaults:
+      run:
+        shell: cmd
+
     steps:
     - name: Checkout repo
       uses: actions/checkout@v2
