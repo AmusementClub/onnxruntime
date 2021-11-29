@@ -68,7 +68,6 @@ jobs:
 
     - name: Release
       uses: softprops/action-gh-release@v1
-      if: github.event_name == 'workflow_dispatch'
       with:
         files: onnxruntime-gpu-win64.zip
         name: Build ${{ env.ORT_VERSION }}
