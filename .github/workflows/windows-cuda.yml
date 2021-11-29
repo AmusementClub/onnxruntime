@@ -1,0 +1,57 @@
+name: Build (Windows, CUDA)
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build-windows:
+    runs-on: windows-2019
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+      with:
+        submodules: recursive
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Setup CUDA
+      run: |
+        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/11.4.3/network_installers/cuda_11.4.3_win10_network.exe
+        cuda_installer.exe -s nvcc_11.4 cudart_11.4 visual_studio_integration_11.4 cublas_dev_11.4 cufft_dev_11.4 curand_dev_11.4 cusparse_dev_11.4 cupti_11.4 thurst_11.4
+
+    - name: Checkout cuda
+      uses: actions/checkout@v2
+      with:
+        repository: AmusementClub/cuda
+        token: ${{ secrets.REPO_TOKEN }}
+        ref: cudnn-8.2.4
+        path: cuda
+
+    - name: Configure
+      run: cmake -S cmake -B build -LA
+        -D onnxruntime_BUILD_UNIT_TESTS=OFF -D Protobuf_USE_STATIC_LIBS=ON -D onnxruntime_BUILD_SHARED_LIB=ON
+        -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON -D onnxruntime_USE_AVX2=ON
+        -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4" -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn" -D CMAKE_CUDA_ARCHITECTURES=50-virtual
+      env:
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+        CUDA_PATH_V11_5: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+
+    - name: Build
+      run: cmake --build build --config Release --verbose
+      env:
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+        CUDA_PATH_V11_4: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+
+    - name: Install
+      run: cmake --install build --prefix onnxruntime-gpu
+
+    - name: Show
+      run: ls -R onnxruntime-gpu
+
+    - name: Upload
+      uses: actions/upload-artifact@v2
+      with:
+        name: onnxruntime-windows-cuda
+        retention-days: 1
+        path: onnxruntime-gpu
