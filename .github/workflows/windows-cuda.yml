@@ -39,7 +39,7 @@ jobs:
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4" -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn" -D CMAKE_CUDA_ARCHITECTURES=50-virtual
       env:
         CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
-        CUDA_PATH_V11_5: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+        CUDA_PATH_V11_4: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
 
     - name: Build
       run: cmake --build build --config Release --verbose
