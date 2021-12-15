@@ -47,6 +47,9 @@ jobs:
 
     - name: Build
       run: cmake --build build --config Release --verbose
+      env:
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+        CUDA_PATH_V11_4: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
 
     - name: Install
       run: cmake --install build --prefix onnxruntime-gpu
