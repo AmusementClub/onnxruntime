@@ -40,7 +40,7 @@ jobs:
         -D onnxruntime_BUILD_UNIT_TESTS=OFF -D Protobuf_USE_STATIC_LIBS=ON -D onnxruntime_BUILD_SHARED_LIB=ON
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON -D onnxruntime_USE_AVX2=ON
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn" 
-        -D CMAKE_CUDA_ARCHITECTURES=50 -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets -arch=compute_61 -code=sm_61 -arch=compute_75 -code=sm_75 -arch=compute_86 -code=sm_86"
+        -D CMAKE_CUDA_ARCHITECTURES=50 -D CMAKE_CUDA_FLAGS_Release="-t 0 -Wno-deprecated-gpu-targets -gencode=arch=compute_61,code=sm_61 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_86,code=sm_86"
       env:
         CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
         CUDA_PATH_V11_4: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
