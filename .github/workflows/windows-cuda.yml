@@ -21,11 +21,21 @@ jobs:
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
+    - name: Setup Ninja
+      run: pip install ninja
+
+    - name: Cache CUDA
+      id: cache-cuda
+      uses: actions/cache@v2
+      with:
+        path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
+        key: ${{ runner.os }}-cuda-11.4.3
+
     - name: Setup CUDA
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
         curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/11.4.3/network_installers/cuda_11.4.3_win10_network.exe
-        cuda_installer.exe -s nvcc_11.4 cudart_11.4 visual_studio_integration_11.4 cublas_dev_11.4 cufft_dev_11.4 curand_dev_11.4 cusparse_dev_11.4 cupti_11.4 thrust_11.4
+        cuda_installer.exe -s nvcc_11.4 cudart_11.4 cublas_dev_11.4 cufft_dev_11.4 curand_dev_11.4 cusparse_dev_11.4 cupti_11.4 thrust_11.4
 
     - name: Checkout cuda
       uses: actions/checkout@v2
@@ -36,20 +46,16 @@ jobs:
         path: cuda
 
     - name: Configure
-      run: cmake -S cmake -B build -LA
+      run: cmake -S cmake -B build -G Ninja -LA
+        -D CMAKE_BUILD_TYPE=Release
         -D onnxruntime_BUILD_UNIT_TESTS=OFF -D Protobuf_USE_STATIC_LIBS=ON -D onnxruntime_BUILD_SHARED_LIB=ON
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON -D onnxruntime_USE_AVX2=ON
-        -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn" 
-        -D CMAKE_CUDA_ARCHITECTURES=50 -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets -gencode arch=compute_50,code=[sm_61,sm_75,sm_86]"
-      env:
-        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
-        CUDA_PATH_V11_4: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+        -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4"
+        -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn" 
+        -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real" -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets"
 
     - name: Build
-      run: cmake --build build --config Release --verbose
-      env:
-        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
-        CUDA_PATH_V11_4: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4
+      run: cmake --build build --verbose
 
     - name: Install
       run: cmake --install build --prefix onnxruntime-gpu
