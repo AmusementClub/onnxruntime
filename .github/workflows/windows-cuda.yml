@@ -42,6 +42,7 @@ jobs:
       run: |
         curl -s -o cub.zip -L https://github.com/NVIDIA/cub/archive/refs/tags/1.16.0.zip
         unzip -q cub.zip
+        icacls "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.6\include\*" /grant %username%:f
         rmdir /s /q "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.6\include\cub"
         move cub-1.16.0\cub "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.6\include"
 
