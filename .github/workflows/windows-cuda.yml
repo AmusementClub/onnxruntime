@@ -37,6 +37,14 @@ jobs:
         curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/11.6.1/network_installers/cuda_11.6.1_windows_network.exe
         cuda_installer.exe -s nvcc_11.6 cudart_11.6 cublas_dev_11.6 cufft_dev_11.6 curand_dev_11.6 cusparse_dev_11.6 cupti_11.6 thrust_11.6
 
+    # requires https://github.com/NVIDIA/cub/commit/c6e338d829c1c77f8e5b4523267f1cd00ea3669b
+    - name: Upgrade cub to 1.16
+      run: |
+        curl -s -o cub.zip -L https://github.com/NVIDIA/cub/archive/refs/tags/1.16.0.zip
+        unzip -q cub.zip
+        rmdir /S "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.6\include\cub"
+        move cub-1.16.0\cub "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.6\include"
+
     - name: Checkout cuda
       uses: actions/checkout@v2
       with:
