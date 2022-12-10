@@ -39,7 +39,7 @@ jobs:
         cuda_installer.exe -s nvcc_11.8 cudart_11.8 cublas_dev_11.8 cufft_dev_11.8 curand_dev_11.8 cusparse_dev_11.8 cupti_11.8 thrust_11.8
 
     - name: Checkout cuda
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
         repository: AmusementClub/cuda
         token: ${{ secrets.REPO_TOKEN }}
