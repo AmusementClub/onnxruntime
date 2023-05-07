@@ -16,7 +16,7 @@ jobs:
       with:
         submodules: recursive
         # master
-        ref: 8ed3dfe0633f5772f1684a5c9f7e68c7acec00d2
+        ref: 958846fdd1d71b06c25c64d96629f74fc90caea6
         fetch-depth: 0
 
     - name: Setup MSVC
@@ -56,6 +56,7 @@ jobs:
         -D onnxruntime_BUILD_UNIT_TESTS=OFF -D Protobuf_USE_STATIC_LIBS=ON -D onnxruntime_BUILD_SHARED_LIB=ON
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn"
+        -D onnxruntime_USE_DML=ON
         -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real;89-real" -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets -use_fast_math"
       env:
         CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8
