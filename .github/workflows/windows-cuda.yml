@@ -43,7 +43,7 @@ jobs:
       with:
         repository: AmusementClub/cuda
         token: ${{ secrets.REPO_TOKEN }}
-        ref: cudnn-8.9.0
+        ref: cudnn-8.6.0
         path: cuda
 
     - name: Install GNU Patch
