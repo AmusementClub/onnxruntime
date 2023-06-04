@@ -30,20 +30,20 @@ jobs:
       uses: actions/cache@v3
       with:
         path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-        key: ${{ runner.os }}-cuda-11.8.0
+        key: ${{ runner.os }}-cuda-12.1.1
 
     - name: Setup CUDA
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
-        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe
-        cuda_installer.exe -s nvcc_11.8 cudart_11.8 cublas_dev_11.8 cufft_dev_11.8 curand_dev_11.8 cusparse_dev_11.8 cupti_11.8 thrust_11.8
+        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.1.1/network_installers/cuda_12.1.1_windows_network.exe
+        cuda_installer.exe -s nvcc_12.1 cudart_12.1 cublas_dev_12.1 cufft_dev_12.1 curand_dev_12.1 cusparse_dev_12.1 cupti_12.1 thrust_12.1
 
     - name: Checkout cuda
       uses: actions/checkout@v3
       with:
         repository: AmusementClub/cuda
         token: ${{ secrets.REPO_TOKEN }}
-        ref: cudnn-8.6.0
+        ref: cudnn-8.9.0
         path: cuda
 
     - name: Install GNU Patch
@@ -59,7 +59,7 @@ jobs:
         -D onnxruntime_USE_DML=ON
         -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real;89-real" -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets -use_fast_math"
       env:
-        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1
 
     - name: Build
       run: cmake --build build
