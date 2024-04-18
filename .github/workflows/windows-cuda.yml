@@ -47,9 +47,6 @@ jobs:
         cp -r cudnn-windows-*/include cudnn/ -v
         cp -r cudnn-windows-*/lib cudnn/ -v
 
-    - name: Install GNU Patch
-      run: choco install patch
-
     - name: Configure
       run: cmake -S cmake -B build -G Ninja -Wno-dev -LA
         -D CMAKE_BUILD_TYPE=Release
@@ -59,7 +56,6 @@ jobs:
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_USE_CUDA_NHWC_OPS=ON
         -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn"
         -D onnxruntime_USE_DML=ON
-        -D onnxruntime_USE_NEURAL_SPEED=OFF
         -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real;89-real" -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets -use_fast_math"
       env:
         CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
