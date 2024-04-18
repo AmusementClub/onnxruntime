@@ -12,11 +12,11 @@ jobs:
 
     steps:
     - name: Checkout repo
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         submodules: recursive
         # master
-        ref: 73584f9360dbf8ba149f2c291f0bb190bf662ae2
+        ref: 24652b96f0ed9b2894a72afa942cf2b19da55f32
         fetch-depth: 0
 
     - name: Setup MSVC
@@ -27,24 +27,25 @@ jobs:
 
     - name: Cache CUDA
       id: cache-cuda
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-        key: ${{ runner.os }}-cuda-12.1.1
+        key: ${{ runner.os }}-cuda-12.4.0
+        save-always: true
 
     - name: Setup CUDA
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
-        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.1.1/network_installers/cuda_12.1.1_windows_network.exe
-        cuda_installer.exe -s nvcc_12.1 cudart_12.1 cublas_dev_12.1 cufft_dev_12.1 curand_dev_12.1 cusparse_dev_12.1 cupti_12.1 thrust_12.1
+        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
+        cuda_installer.exe -s nvcc_12.4 cudart_12.4 cublas_dev_12.4 cufft_dev_12.4 curand_dev_12.4 cusparse_dev_12.4 cupti_12.4 thrust_12.4
 
-    - name: Checkout cuda
-      uses: actions/checkout@v3
-      with:
-        repository: AmusementClub/cuda
-        token: ${{ secrets.REPO_TOKEN }}
-        ref: cudnn-8.9.0
-        path: cuda
+    - name: Download cuDNN inference library
+      run: |
+        curl -LJ https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-8.9.7.29_cuda12-archive.zip -o cudnn.zip
+        unzip cudnn.zip
+        mkdir -p cudnn
+        cp -r cudnn-windows-*/include cudnn/ -v
+        cp -r cudnn-windows-*/lib cudnn/ -v
 
     - name: Install GNU Patch
       run: choco install patch
@@ -59,7 +60,7 @@ jobs:
         -D onnxruntime_USE_DML=ON
         -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real;89-real" -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets -use_fast_math"
       env:
-        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
 
     - name: Build
       run: cmake --build build
@@ -71,7 +72,7 @@ jobs:
       run: ls -R onnxruntime-gpu
 
     - name: Upload
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: onnxruntime-windows-cuda
         retention-days: 1
