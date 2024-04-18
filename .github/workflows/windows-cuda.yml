@@ -37,7 +37,7 @@ jobs:
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
         curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
-        cuda_installer.exe -s nvcc_12.4 cudart_12.4 cublas_dev_12.4 cufft_dev_12.4 curand_dev_12.4 cusparse_dev_12.4 cupti_12.4 thrust_12.4
+        cuda_installer.exe -s nvcc_12.4 cudart_12.4 cublas_dev_12.4 cufft_dev_12.4 curand_dev_12.4 cusparse_dev_12.4 cupti_12.4 thrust_12.4 nvtx_12.4
 
     - name: Download cuDNN inference library
       run: |
