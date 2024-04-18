@@ -56,7 +56,8 @@ jobs:
         -D CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -D ONNX_USE_MSVC_STATIC_RUNTIME=ON
         -D onnxruntime_BUILD_UNIT_TESTS=OFF -D Protobuf_USE_STATIC_LIBS=ON -D onnxruntime_BUILD_SHARED_LIB=ON
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON
-        -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn"
+        -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_USE_CUDA_NHWC_OPS=ON
+        -D onnxruntime_CUDNN_HOME="%cd%\cuda\cudnn"
         -D onnxruntime_USE_DML=ON
         -D onnxruntime_USE_NEURAL_SPEED=OFF
         -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real;89-real" -D CMAKE_CUDA_FLAGS="-t 0 -Wno-deprecated-gpu-targets -use_fast_math"
