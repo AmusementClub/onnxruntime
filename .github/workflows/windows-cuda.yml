@@ -16,7 +16,7 @@ jobs:
       with:
         submodules: recursive
         # master
-        ref: 24652b96f0ed9b2894a72afa942cf2b19da55f32
+        ref: 9001c69b84898bbbe3529b0333a9d16df5f6469e
         fetch-depth: 0
 
     - name: Setup MSVC
