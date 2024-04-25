@@ -30,13 +30,13 @@ jobs:
       uses: actions/cache@v4
       with:
         path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-        key: ${{ runner.os }}-cuda-12.4.0
+        key: ${{ runner.os }}-cuda-12.4.1
         save-always: true
 
     - name: Setup CUDA
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
-        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.4.0/network_installers/cuda_12.4.0_windows_network.exe
+        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.4.1/network_installers/cuda_12.4.1_windows_network.exe
         cuda_installer.exe -s nvcc_12.4 cudart_12.4 cublas_dev_12.4 cufft_dev_12.4 curand_dev_12.4 cusparse_dev_12.4 cupti_12.4 thrust_12.4 nvtx_12.4
 
     - name: Download cuDNN inference library
@@ -60,7 +60,7 @@ jobs:
         -D onnxruntime_USE_DML=ON
         -D onnxruntime_USE_NEURAL_SPEED=OFF
         -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real;89-real"
-        -D CMAKE_CUDA_FLAGS="-Wno-deprecated-gpu-targets -use_fast_math -diag-suppress 940"
+        -D CMAKE_CUDA_FLAGS="-Wno-deprecated-gpu-targets -diag-suppress 940"
       env:
         CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
 
