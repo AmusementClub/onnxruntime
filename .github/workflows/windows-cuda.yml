@@ -4,7 +4,7 @@ on: [push, workflow_dispatch]
 
 jobs:
   build-windows:
-    runs-on: windows-2022
+    runs-on: windows-2025
 
     defaults:
       run:
@@ -16,7 +16,7 @@ jobs:
       with:
         submodules: recursive
         # master
-        ref: eb41d57f21a2c1e5c99daf868df3963840804abd
+        ref: 4754a1d64e5920a715b0396906f339e6c15742a0
         fetch-depth: 0
 
     - name: Setup MSVC
@@ -30,18 +30,17 @@ jobs:
       uses: actions/cache@v4
       with:
         path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-        key: ${{ runner.os }}-cuda-12.4.1
-        save-always: true
+        key: ${{ runner.os }}-cuda-12.9.1
 
     - name: Setup CUDA
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
-        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.4.1/network_installers/cuda_12.4.1_windows_network.exe
-        cuda_installer.exe -s nvcc_12.4 cudart_12.4 cublas_dev_12.4 cufft_dev_12.4 curand_dev_12.4 cusparse_dev_12.4 cupti_12.4 thrust_12.4 nvtx_12.4
+        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe
+        cuda_installer.exe -s nvcc_12.9 cudart_12.9 cublas_dev_12.9 cufft_dev_12.9 curand_dev_12.9 cusparse_dev_12.9 cupti_12.9 thrust_12.9 nvtx_12.9
 
     - name: Download cuDNN inference library
       run: |
-        curl -LJ https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-8.9.7.29_cuda12-archive.zip -o cudnn.zip
+        curl -LJ https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.12.0.46_cuda12-archive.zip -o cudnn.zip
         unzip cudnn.zip
         mkdir -p cudnn
         cp -r cudnn-windows-*/include cudnn/ -v
@@ -59,10 +58,10 @@ jobs:
         -D onnxruntime_CUDNN_HOME="%cd%\cudnn"
         -D onnxruntime_USE_DML=ON
         -D onnxruntime_USE_NEURAL_SPEED=OFF
-        -D CMAKE_CUDA_ARCHITECTURES="50;61-real;75-real;86-real;89-real"
+        -D CMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120"
         -D CMAKE_CUDA_FLAGS="-Wno-deprecated-gpu-targets -diag-suppress 940"
       env:
-        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9
 
     - name: Build
       run: cmake --build build --verbose
