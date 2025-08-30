@@ -49,16 +49,15 @@ jobs:
     - name: Configure
       run: cmake -S cmake -B build -G Ninja -Wno-dev -LA
         -D CMAKE_BUILD_TYPE=Release
-        -D CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -D ONNX_USE_MSVC_STATIC_RUNTIME=ON
-        -D onnxruntime_BUILD_UNIT_TESTS=OFF -D Protobuf_USE_STATIC_LIBS=ON -D onnxruntime_BUILD_SHARED_LIB=ON
+        -D CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -D ONNX_USE_MSVC_STATIC_RUNTIME=ON -D ABSL_MSVC_STATIC_RUNTIME=ON
+        -D onnxruntime_BUILD_UNIT_TESTS=OFF -D onnxruntime_BUILD_SHARED_LIB=ON
         -D onnxruntime_ENABLE_LTO=OFF
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_NVCC_THREADS=1
-        -D onnxruntime_USE_CUDA_NHWC_OPS=ON -D onnxruntime_ENABLE_NVTX_PROFILE=OFF
+        -D onnxruntime_USE_CUDA_NHWC_OPS=ON
         -D onnxruntime_CUDNN_HOME="%cd%\cudnn"
         -D onnxruntime_USE_DML=ON
-        -D onnxruntime_USE_NEURAL_SPEED=OFF
-        -D CMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120"
+        -D CMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real"
         -D CMAKE_CUDA_FLAGS="-Wno-deprecated-gpu-targets -diag-suppress 940"
       env:
         CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9
