@@ -54,7 +54,6 @@ jobs:
         -D onnxruntime_ENABLE_LTO=ON
         -D onnxruntime_USE_FLASH_ATTENTION=OFF -D onnxruntime_USE_LEAN_ATTENTION=OFF
         -D onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF -D onnxruntime_USE_FPA_INTB_GEMM=OFF
-        -D onnxruntime_DISABLE_OPTIONAL_TYPE=ON -D onnxruntime_DISABLE_FLOAT8_TYPES=ON
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_NVCC_THREADS=1
         -D onnxruntime_USE_CUDA_NHWC_OPS=ON
