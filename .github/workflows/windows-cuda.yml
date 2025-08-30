@@ -52,7 +52,7 @@ jobs:
         -D CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -D ONNX_USE_MSVC_STATIC_RUNTIME=ON -D ABSL_MSVC_STATIC_RUNTIME=ON
         -D onnxruntime_BUILD_UNIT_TESTS=OFF -D onnxruntime_BUILD_SHARED_LIB=ON
         -D onnxruntime_ENABLE_LTO=ON
-        -D onnxruntime_USE_FLASH_ATTENTION=ON -D onnxruntime_USE_LEAN_ATTENTION=OFF
+        -D onnxruntime_USE_FLASH_ATTENTION=OFF -D onnxruntime_USE_LEAN_ATTENTION=OFF
         -D onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF -D onnxruntime_USE_FPA_INTB_GEMM=ON
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_NVCC_THREADS=1
