@@ -21,7 +21,7 @@ jobs:
 
     - name: Fix
       run: |
-        (echo '#if USE_FPA_INTB_GEMM' & type onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc & echo '#endif') > temp && move /y temp onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc
+        (echo #if USE_FPA_INTB_GEMM & type onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc & echo #endif) > temp && move /y temp onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc
         type onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc
 
     - name: Setup MSVC
