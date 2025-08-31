@@ -20,7 +20,7 @@ jobs:
         fetch-depth: 0
 
     - name: Fix
-      run: (echo #if USE_FPA_INTB_GEMM & type onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc & echo #endif) > temp && move /y temp onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc
+      run: (echo '#if USE_FPA_INTB_GEMM' & type onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc & echo '#endif') > temp && move /y temp onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc
 
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
