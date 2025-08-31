@@ -19,6 +19,9 @@ jobs:
         ref: 4754a1d64e5920a715b0396906f339e6c15742a0
         fetch-depth: 0
 
+    - name: Fix
+      run: (echo #if USE_FPA_INTB_GEMM & type onnxruntime/contrib_ops/cuda/llm/fpA_intB_gemm_profiler.cc & echo #endif) > temp && move /y temp onnxruntime/contrib_ops/cuda/llm/fpA_intB_gemm_profiler.cc
+
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
@@ -53,7 +56,7 @@ jobs:
         -D onnxruntime_BUILD_UNIT_TESTS=OFF -D onnxruntime_BUILD_SHARED_LIB=ON
         -D onnxruntime_ENABLE_LTO=ON
         -D onnxruntime_USE_FLASH_ATTENTION=OFF -D onnxruntime_USE_LEAN_ATTENTION=OFF
-        -D onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF -D onnxruntime_USE_FPA_INTB_GEMM=ON
+        -D onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF -D onnxruntime_USE_FPA_INTB_GEMM=OFF
         -D onnxruntime_ENABLE_CPU_FP16_OPS=OFF -D onnxruntime_USE_AVX=ON
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_NVCC_THREADS=1
         -D onnxruntime_USE_CUDA_NHWC_OPS=ON
