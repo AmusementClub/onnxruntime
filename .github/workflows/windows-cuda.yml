@@ -58,7 +58,7 @@ jobs:
         -D onnxruntime_USE_CUDA=ON -D onnxruntime_CUDA_HOME="%CUDA_PATH%" -D onnxruntime_NVCC_THREADS=1
         -D onnxruntime_USE_CUDA_NHWC_OPS=ON
         -D onnxruntime_CUDNN_HOME="%cd%\cudnn"
-        -D onnxruntime_ENABLE_NVTX_PROFILE=ON
+        -D onnxruntime_ENABLE_NVTX_PROFILE=OFF
         -D onnxruntime_USE_DML=ON
         -D CMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real"
       env:
