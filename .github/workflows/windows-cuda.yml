@@ -22,7 +22,8 @@ jobs:
     - name: Fix
       run: |
         (echo #if USE_FPA_INTB_GEMM & type onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc & echo #endif) > temp && move /y temp onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc
-        type onnxruntime\contrib_ops\cuda\llm\fpA_intB_gemm_profiler.cc
+        powershell -Command "(Get-Content -Path 'onnxruntime/contrib_ops/cuda/bert/attention_impl.h' -Raw) -replace 'longlong4', 'longlong4_16a' | Set-Content -Path 'onnxruntime/contrib_ops/cuda/bert/attention_impl.h'"
+        powershell -Command "(Get-Content -Path 'onnxruntime/contrib_ops/cuda/bert/attention_strided_copy.cu' -Raw) -replace 'longlong4', 'longlong4_16a' | Set-Content -Path 'onnxruntime/contrib_ops/cuda/bert/attention_strided_copy.cu'"
 
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
