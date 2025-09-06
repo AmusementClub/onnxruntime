@@ -27,8 +27,8 @@ jobs:
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Setup Ninja
-      run: pip install ninja
+    - name: Setup CMake and Ninja
+      run: pip install cmake ninja
 
     - name: Cache CUDA
       id: cache-cuda
@@ -42,6 +42,7 @@ jobs:
       run: |
         curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/13.0.1/network_installers/cuda_13.0.1_windows_network.exe
         cuda_installer.exe -s nvcc_13.0 cudart_13.0 cublas_dev_13.0 cufft_dev_13.0 curand_dev_13.0 cusparse_dev_13.0 cupti_13.0 thrust_13.0 nvtx_13.0 crt_13.0 nvptxcompiler_13.0
+        cmake --version
 
     - name: Download cuDNN inference library
       run: |
