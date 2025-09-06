@@ -67,6 +67,7 @@ jobs:
         -D CMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real"
         -D CMAKE_CUDA_COMPILER="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\nvcc.exe"
         -D CMAKE_CUDA_FLAGS="-D__NV_NO_VECTOR_DEPRECATION_DIAG"
+        -D onnxruntime_DISABLE_FLOAT4_TYPES=ON
       env:
         CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
 
