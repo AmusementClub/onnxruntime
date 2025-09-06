@@ -16,7 +16,7 @@ jobs:
       with:
         submodules: recursive
         # master
-        ref: 4754a1d64e5920a715b0396906f339e6c15742a0
+        ref: ecb26fb7754d7c9edf24b1844ea807180a2e3e23
         fetch-depth: 0
 
     - name: Fix
@@ -35,17 +35,17 @@ jobs:
       uses: actions/cache@v4
       with:
         path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-        key: ${{ runner.os }}-cuda-12.9.1
+        key: ${{ runner.os }}-cuda-13.0.1
 
     - name: Setup CUDA
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
-        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/12.9.1/network_installers/cuda_12.9.1_windows_network.exe
-        cuda_installer.exe -s nvcc_12.9 cudart_12.9 cublas_dev_12.9 cufft_dev_12.9 curand_dev_12.9 cusparse_dev_12.9 cupti_12.9 thrust_12.9 nvtx_12.9
+        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/13.0.1/network_installers/cuda_13.0.1_windows_network.exe
+        cuda_installer.exe -s nvcc_13.0 cudart_13.0 cublas_dev_13.0 cufft_dev_13.0 curand_dev_13.0 cusparse_dev_13.0 cupti_13.0 thrust_13.0 nvtx_13.0 crt_13.0 nvptxcompiler_13.0
 
     - name: Download cuDNN inference library
       run: |
-        curl -LJ https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.12.0.46_cuda12-archive.zip -o cudnn.zip
+        curl -LJ https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.13.0.50_cuda13-archive.zip -o cudnn.zip
         unzip cudnn.zip
         mkdir -p cudnn
         cp -r cudnn-windows-*/include cudnn/ -v
@@ -67,7 +67,7 @@ jobs:
         -D onnxruntime_USE_DML=ON
         -D CMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real"
       env:
-        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
 
     - name: Build
       run: cmake --build build --verbose
