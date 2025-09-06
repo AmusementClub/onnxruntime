@@ -16,7 +16,7 @@ jobs:
       with:
         submodules: recursive
         # master
-        ref: ecb26fb7754d7c9edf24b1844ea807180a2e3e23
+        ref: 4754a1d64e5920a715b0396906f339e6c15742a0
         fetch-depth: 0
 
     - name: Fix
