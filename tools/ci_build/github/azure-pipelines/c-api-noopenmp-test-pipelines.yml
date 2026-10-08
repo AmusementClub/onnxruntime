@@ -69,21 +69,13 @@ stages:
 
 - stage: Android_Java_API_AAR_Testing_Full
   dependsOn: Setup
+  variables:
+    ReleaseVersionSuffix: $[ stageDependencies.Setup.Restore_And_Use_Variables.outputs['Set_Release_Version_Suffix.ReleaseVersionSuffix'] ]
   jobs:
   - template: templates/android-java-api-aar-test.yml
     parameters:
       artifactName: 'onnxruntime-android-full-aar'
       ReleaseVersionSuffix: $(ReleaseVersionSuffix)
-
-- stage: Final_AAR_Testing_Android_QNN
-  dependsOn: Setup
-  jobs:
-  - template: templates/android-java-api-aar-test.yml
-    parameters:
-      artifactName: 'onnxruntime-android-qnn-aar'
-      packageName: 'onnxruntime-android-qnn'
-      #TODO: get this information from the setup stage
-      QnnSDKVersion: '2.37.1.250807'
 
 - template: nuget/templates/test_win.yml
   parameters:
@@ -104,8 +96,17 @@ stages:
 
 - template: nuget/templates/test_macos.yml
   parameters:
-    AgentPool: macOS-14
+    AgentPool: 'AcesShared'
+    UseHostedVmImage: 'false'
+    PoolDemands: 'ImageOverride -equals ACES_VM_SharedPool_Sequoia'
     ArtifactSuffix: 'CPU'
+
+- template: nodejs/templates/test_macos.yml
+  parameters:
+    AgentPool: 'AcesShared'
+    UseHostedVmImage: 'false'
+    PoolDemands: 'ImageOverride -equals ACES_VM_SharedPool_Sequoia'
+    StageSuffix: 'MacOS_ARM64'
 
 - template: nodejs/templates/test_win.yml
   parameters:
@@ -115,11 +116,14 @@ stages:
 - template: nodejs/templates/test_linux.yml
   parameters:
     AgentPool: 'onnxruntime-Ubuntu2204-AMD-CPU'
-    StageSuffix: 'Linux_CPU_x64'
+    StageSuffix: 'Linux_CPU_x64_Node24'
+    NodeVersion: '24.x'
 
-- template: nodejs/templates/test_macos.yml
+- template: nodejs/templates/test_linux.yml
   parameters:
-    StageSuffix: 'macOS_CPU_x64'
+    AgentPool: 'onnxruntime-Ubuntu2204-AMD-CPU'
+    StageSuffix: 'Linux_CPU_x64_Node22'
+    NodeVersion: '22.x'
 
 - template: nuget/templates/test_win.yml
   parameters:
@@ -127,7 +131,7 @@ stages:
     NugetPackageName: 'Microsoft.ML.OnnxRuntime.Gpu'
     ArtifactSuffix: 'GPU'
     StageSuffix: 'GPU'
-    CudaVersion: 12.2
+    CudaVersion: 12.8
 
 - template: nuget/templates/test_win.yml
   parameters:
@@ -136,7 +140,7 @@ stages:
     ArtifactSuffix: 'GPU'
     StageSuffix: 'GPU'
     MoreSuffix: '_Windows'
-    CudaVersion: 12.2
+    CudaVersion: 12.8
 
 - template: nuget/templates/test_linux.yml
   parameters:
@@ -144,7 +148,7 @@ stages:
     ArtifactSuffix: 'GPU'
     StageSuffix: 'GPU'
     NugetPackageName: 'Microsoft.ML.OnnxRuntime.Gpu'
-    CudaVersion: 12.2
+    CudaVersion: 12.8
 
 - template: nuget/templates/test_linux.yml
   parameters:
@@ -153,9 +157,65 @@ stages:
     StageSuffix: 'GPU'
     MoreSuffix: '_Linux'
     NugetPackageName: 'Microsoft.ML.OnnxRuntime.Gpu.Linux'
-    CudaVersion: 12.2
+    CudaVersion: 12.8
 
+- template: templates/test-binary-archive-stage.yml
+  parameters:
+    artifactName: onnxruntime-linux-aarch64
+    artifactPipelineResource: build
+    previousStageName: Setup
+    platform: linux-aarch64
+    agentPool: onnxruntime-linux-ARM64-CPU-2019
 
+- template: templates/test-binary-archive-stage.yml
+  parameters:
+    artifactName: onnxruntime-linux-x64
+    artifactPipelineResource: build
+    previousStageName: Setup
+    platform: linux-x64
+    agentPool: onnxruntime-Ubuntu2204-AMD-CPU
+
+- template: templates/test-binary-archive-stage.yml
+  parameters:
+    artifactName: onnxruntime-osx-arm64
+    artifactPipelineResource: build
+    previousStageName: Setup
+    platform: osx-arm64
+    agentPool:
+      name: AcesShared
+      os: macOS
+      demands:
+      - ImageOverride -equals ACES_VM_SharedPool_Sequoia
+    agentSetupSteps:
+    - template: templates/setup-build-tools.yml
+      parameters:
+        host_cpu_arch: arm64
+
+- template: templates/test-binary-archive-stage.yml
+  parameters:
+    artifactName: onnxruntime-win-arm64
+    artifactPipelineResource: build
+    previousStageName: Setup
+    platform: win-arm64
+    agentPool:
+      name: onnxruntime-medium-arm64-scus
+
+- template: templates/test-binary-archive-stage.yml
+  parameters:
+    artifactName: onnxruntime-win-arm64x
+    artifactPipelineResource: build
+    previousStageName: Setup
+    platform: win-arm64x
+    agentPool:
+      name: onnxruntime-medium-arm64-scus
+
+- template: templates/test-binary-archive-stage.yml
+  parameters:
+    artifactName: onnxruntime-win-x64
+    artifactPipelineResource: build
+    previousStageName: Setup
+    platform: win-x64
+    agentPool: onnxruntime-Win-CPU-2022
 
 # Run GPU tests.
 - stage: Windows_Packaging_cuda_Testing
@@ -167,13 +227,15 @@ stages:
       pool: onnxruntime-Win2022-GPU-A10
       timeoutInMinutes: 180
       steps:
-        - checkout: self
-          clean: true
-          submodules: none
+        - template: templates/jobs/checkout-and-git-redirect.yml
 
         - download: build
           artifact: 'Windows_Packaging_cuda_build_artifacts'
           displayName: 'Download Windows GPU Packages Build'
+
+        - template: templates/setup-build-tools.yml
+          parameters:
+            host_cpu_arch: 'x64'
 
         - task: CmdLine@2
           inputs:
@@ -188,17 +250,6 @@ stages:
             jdkArchitectureOption: x64
             jdkSourceOption: 'PreInstalled'
 
-        - task: UsePythonVersion@0
-          inputs:
-            versionSpec: '3.12'
-            addToPath: true
-            architecture: x64
-
-        - task: PipAuthenticate@1
-          displayName: 'Pip Authenticate'
-          inputs:
-            artifactFeeds: 'Lotus'
-
         - task: PythonScript@0
           displayName: 'Update CTest Path References'
           inputs:
@@ -207,13 +258,9 @@ stages:
               "$(Build.BinariesDirectory)/RelWithDebInfo/CTestTestfile.cmake"
               "$(Build.BinariesDirectory)/RelWithDebInfo"
 
-        - task: NodeTool@0
-          inputs:
-            versionSpec: '22.x'
-
         - template: templates/jobs/download_win_gpu_library.yml
           parameters:
-            CudaVersion: 12.2
+            CudaVersion: 12.8
             DownloadCUDA: true
             DownloadTRT: true
 
@@ -223,12 +270,6 @@ stages:
             scriptPath: '$(Build.SourcesDirectory)\tools\ci_build\build.py'
             arguments: '--config RelWithDebInfo --use_binskim_compliant_compile_flags --enable_lto --disable_rtti --build_dir $(Build.BinariesDirectory) --skip_submodule_sync --build_shared_lib --test --enable_onnx_tests'
             workingDirectory: '$(Build.BinariesDirectory)'
-        # Previous stage only assembles the java binaries, testing will be done in this stage with GPU machine
-        - template: templates/make_java_win_binaries.yml
-          parameters:
-            msbuildPlatform: x64
-            java_artifact_id: onnxruntime_gpu
-            buildOnly: false
 
 - stage: Windows_Packaging_Tensorrt_Testing
   dependsOn: Setup
@@ -239,14 +280,15 @@ stages:
       pool: onnxruntime-Win2022-GPU-A10
       timeoutInMinutes: 180
       steps:
-        - checkout: self
-          clean: true
-          submodules: none
-
+        - template: templates/jobs/checkout-and-git-redirect.yml
 
         - download: build
           artifact: 'Windows_Packaging_tensorrt_build_artifacts'
           displayName: 'Download Windows GPU Packages Build'
+
+        - template: templates/setup-build-tools.yml
+          parameters:
+            host_cpu_arch: 'x64'
 
         - task: CmdLine@2
           inputs:
@@ -261,17 +303,6 @@ stages:
             jdkArchitectureOption: x64
             jdkSourceOption: 'PreInstalled'
 
-        - task: UsePythonVersion@0
-          inputs:
-            versionSpec: '3.12'
-            addToPath: true
-            architecture: x64
-
-        - task: PipAuthenticate@1
-          displayName: 'Pip Authenticate'
-          inputs:
-            artifactFeeds: 'Lotus'
-
         - task: PythonScript@0
           displayName: 'Update CTest Path References'
           inputs:
@@ -280,13 +311,9 @@ stages:
               "$(Build.BinariesDirectory)/RelWithDebInfo/CTestTestfile.cmake"
               "$(Build.BinariesDirectory)/RelWithDebInfo"
 
-        - task: NodeTool@0
-          inputs:
-            versionSpec: '22.x'
-
         - template: templates/jobs/download_win_gpu_library.yml
           parameters:
-            CudaVersion: 12.2
+            CudaVersion: 12.8
             DownloadCUDA: true
             DownloadTRT: true
 
@@ -296,9 +323,3 @@ stages:
             scriptPath: '$(Build.SourcesDirectory)\tools\ci_build\build.py'
             arguments: '--config RelWithDebInfo --use_binskim_compliant_compile_flags --enable_lto --disable_rtti --build_dir $(Build.BinariesDirectory) --skip_submodule_sync --build_shared_lib --test --enable_onnx_tests'
             workingDirectory: '$(Build.BinariesDirectory)'
-        # Previous stage only assembles the java binaries, testing will be done in this stage with GPU machine
-        - template: templates/make_java_win_binaries.yml
-          parameters:
-            msbuildPlatform: x64
-            java_artifact_id: onnxruntime_gpu
-            buildOnly: false

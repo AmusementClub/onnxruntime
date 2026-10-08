@@ -158,6 +158,8 @@ class FusionAttention(Fusion):
                 and isinstance(head_size, np.ndarray)
                 and head_size.size == 1
             ):
+                if num_heads[0] == -1 and self.num_heads > 0 and self.hidden_size == self.num_heads * head_size[0]:
+                    return self.num_heads, self.hidden_size
                 return num_heads[0], num_heads[0] * head_size[0]
 
         return self.num_heads, self.hidden_size
@@ -892,6 +894,13 @@ class FusionAttention(Fusion):
             add_before_layernorm = self.model.match_parent(normalize_node, "Add", 0)
             if add_before_layernorm is not None:
                 start_node = add_before_layernorm
+            elif self.model.find_graph_input(normalize_node.input[0]) is not None:
+                # Pre-LN first block: LN fed directly by graph input.  QKV matching will
+                # still fail from this (first) LN anchor because its inputs are weights, not
+                # the QKV projection path.  The real fusion happens when fuse() is called
+                # again from the second LN/SkipLN anchor after the residual Add, where the
+                # other_inputs and root_input changes (#2-#4) take effect.
+                start_node = normalize_node
             else:
                 return
 
@@ -917,7 +926,8 @@ class FusionAttention(Fusion):
         other_inputs = []
         for _i, node_input in enumerate(start_node.input):
             if node_input not in output_name_to_node:
-                continue
+                if self.model.find_graph_input(node_input) is None:
+                    continue
 
             if node_input == qkv_nodes[0].output[0]:
                 continue
@@ -946,7 +956,7 @@ class FusionAttention(Fusion):
                 root_input = mul_before_layernorm.output[0]
             else:
                 return
-        elif normalize_node.op_type == "LayerNormalization":
+        elif normalize_node.op_type in ("LayerNormalization", "SkipLayerNormalization"):
             children = input_name_to_nodes[root_input]
             for child in children:
                 if child.op_type == "LayerNormalization":
@@ -961,9 +971,10 @@ class FusionAttention(Fusion):
         #  |                                                                     |
         #  |                                                                     |
         #  +---------------------------------------------------------------------+
-        parent_node = output_name_to_node[root_input]
-        if parent_node.op_type == "SkipLayerNormalization" and len(parent_node.output) == 4:
-            root_input = parent_node.output[0]
+        if root_input in output_name_to_node:
+            parent_node = output_name_to_node[root_input]
+            if parent_node.op_type == "SkipLayerNormalization" and len(parent_node.output) == 4:
+                root_input = parent_node.output[0]
 
         children = input_name_to_nodes[root_input]
         children_types = [child.op_type for child in children]
@@ -1063,6 +1074,8 @@ class FusionAttention(Fusion):
 
         # Note that Cast might be removed by OnnxRuntime so we match two patterns here.
         mask_nodes = None
+        is_transformers_5_mask = False
+        is_transformers_5_no_mask = False
         add_qk_str = ""
         if is_distill:
             _, mask_nodes, _ = self.model.match_parent_paths(
@@ -1091,7 +1104,7 @@ class FusionAttention(Fusion):
         elif is_no_mask_attention:
             pass
         else:
-            _, mask_nodes, _ = self.model.match_parent_paths(
+            mask_path, mask_nodes, _ = self.model.match_parent_paths(
                 add_qk,
                 [
                     (["Mul", "Sub", "Cast", "Unsqueeze", "Unsqueeze"], [None, 0, 1, 0, 0]),
@@ -1099,27 +1112,58 @@ class FusionAttention(Fusion):
                     # The following two patterns are for SDPA.
                     (["Where", "Cast", "Sub", "Expand", "Unsqueeze", "Unsqueeze"], [None, 0, 0, 1, 0, 0]),
                     (["Where", "Cast", "Sub", "Cast", "Expand", "Unsqueeze", "Unsqueeze"], [None, 0, 0, 1, 0, 0, 0]),
+                    # Transformers 5 eager attention mask.
+                    (
+                        ["Where", "Expand", "And", "Reshape", "Reshape", "Gather", "Flatten"],
+                        [None, 0, 0, 1, 0, 0, 0],
+                    ),
+                    # Transformers 5 eager attention without an attention_mask input.
+                    (
+                        [
+                            "Where",
+                            "Expand",
+                            "GreaterOrEqual",
+                            "Unsqueeze",
+                            "Unsqueeze",
+                            "Unsqueeze",
+                            "Range",
+                            "Gather",
+                            "Shape",
+                        ],
+                        [None, 0, 0, 0, 0, 0, 0, 1, 0],
+                    ),
                 ],
                 output_name_to_node,
             )
-        if not is_no_mask_attention and mask_nodes is None:
+            is_transformers_5_mask = mask_path == 4
+            is_transformers_5_no_mask = mask_path == 5
+        if not is_no_mask_attention and not is_transformers_5_no_mask and mask_nodes is None:
             logger.debug("fuse_attention: failed to match mask path")
             return
 
-        if not is_no_mask_attention and len(mask_nodes) > 1:
+        if (
+            not is_no_mask_attention
+            and not is_transformers_5_no_mask
+            and len(mask_nodes) > 1
+            and not is_transformers_5_mask
+        ):
             _, mul_val = self.model.get_constant_input(mask_nodes[0])
             # The mask value shall be a float scalar (usually is the lowest float value).
             if (
                 (mul_val is None)
                 or not (isinstance(mul_val, np.ndarray) and mul_val.size == 1)
-                or (float(mul_val) >= 0)
+                or (mul_val.item() >= 0)
             ):
                 return
-            if float(mul_val) != -10000:
-                self.mask_filter_value = float(mul_val)
+            if mul_val.item() != -10000:
+                self.mask_filter_value = mul_val.item()
 
         if matmul_v.input[0] == root_input and matmul_q.input[0] == root_input and matmul_k.input[0] == root_input:
-            mask_index = self.attention_mask.process_mask(mask_nodes[-1].input[0]) if not is_no_mask_attention else None
+            mask_index = (
+                self.attention_mask.process_mask(mask_nodes[-1].input[0])
+                if not is_no_mask_attention and not is_transformers_5_no_mask
+                else None
+            )
 
             attention_last_node = reshape_qkv if einsum_node is None else transpose_qkv
 

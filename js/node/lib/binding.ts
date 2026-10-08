@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+import { isMainThread } from 'worker_threads';
+
 import { InferenceSession, OnnxValue, Tensor, TensorConstructor, env } from 'onnxruntime-common';
 
 type SessionOptions = InferenceSession.SessionOptions;
@@ -16,7 +18,10 @@ type ReturnType = {
 type RunOptions = InferenceSession.RunOptions;
 
 /**
- * Binding exports a simple synchronized inference session object wrap.
+ * Binding exports a simple inference session object wrap.
+ *
+ * `loadModel()` returns a Promise. A session that registers a synchronous JavaScript callback is
+ * constructed on a worker thread so that the event loop remains available to service that callback.
  */
 export declare namespace Binding {
   export interface ValueMetadata {
@@ -27,8 +32,8 @@ export declare namespace Binding {
     type: number;
   }
   export interface InferenceSession {
-    loadModel(modelPath: string, options: SessionOptions): void;
-    loadModel(buffer: ArrayBuffer, byteOffset: number, byteLength: number, options: SessionOptions): void;
+    loadModel(modelPath: string, options: SessionOptions): Promise<void>;
+    loadModel(buffer: ArrayBuffer, byteOffset: number, byteLength: number, options: SessionOptions): Promise<void>;
 
     readonly inputMetadata: ValueMetadata[];
     readonly outputMetadata: ValueMetadata[];
@@ -57,7 +62,14 @@ export const binding =
     // eslint-disable-next-line @typescript-eslint/naming-convention
     InferenceSession: Binding.InferenceSessionConstructor;
     listSupportedBackends: () => Binding.SupportedBackend[];
-    initOrtOnce: (logLevel: number, tensorConstructor: TensorConstructor) => void;
+    initOrtOnce: (logLevel: number, tensorConstructor: TensorConstructor, isMainThread: boolean) => void;
+    /** @internal Native callback bridge used by binding tests, not a supported API. */
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    __testEpContextDataReadCallback: (
+      callback: (name: string) => unknown,
+      maxDataSize: number,
+      name: string,
+    ) => Promise<Buffer>;
   };
 
 let ortInitialized = false;
@@ -86,6 +98,6 @@ export const initOrt = (): void => {
           throw new Error(`Unsupported log level: ${env.logLevel}`);
       }
     }
-    binding.initOrtOnce(logLevel, Tensor);
+    binding.initOrtOnce(logLevel, Tensor, isMainThread);
   }
 };

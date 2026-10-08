@@ -17,6 +17,7 @@ import {
   inferWasmPathPrefixFromScriptSrc,
   isEsmImportMetaUrlHardcodedAsFileUri,
 } from './wasm-utils-import';
+import { loadFile } from './wasm-utils-load-file';
 
 const isProxy = (): boolean => !!env.wasm.proxy && typeof document !== 'undefined';
 let proxyWorker: Worker | undefined;
@@ -133,9 +134,11 @@ export const initializeWebAssemblyAndOrtRuntime = async (): Promise<void> => {
             message.in!.wasm.wasmPaths = {
               wasm: !BUILD_DEFS.DISABLE_JSEP
                 ? new URL('ort-wasm-simd-threaded.jsep.wasm', BUILD_DEFS.ESM_IMPORT_META_URL).href
-                : !BUILD_DEFS.DISABLE_WEBGPU
-                  ? new URL('ort-wasm-simd-threaded.asyncify.wasm', BUILD_DEFS.ESM_IMPORT_META_URL).href
-                  : new URL('ort-wasm-simd-threaded.wasm', BUILD_DEFS.ESM_IMPORT_META_URL).href,
+                : BUILD_DEFS.ENABLE_JSPI
+                  ? new URL('ort-wasm-simd-threaded.jspi.wasm', BUILD_DEFS.ESM_IMPORT_META_URL).href
+                  : !BUILD_DEFS.DISABLE_WEBGPU
+                    ? new URL('ort-wasm-simd-threaded.asyncify.wasm', BUILD_DEFS.ESM_IMPORT_META_URL).href
+                    : new URL('ort-wasm-simd-threaded.wasm', BUILD_DEFS.ESM_IMPORT_META_URL).href,
             };
           }
           proxyWorker.postMessage(message);
@@ -222,6 +225,21 @@ export const releaseSession = async (sessionId: number): Promise<void> => {
   }
 };
 
+export const createLoraAdapter = async (pathOrBuffer: string | Uint8Array): Promise<number> => {
+  if (!BUILD_DEFS.DISABLE_WASM_PROXY && isProxy()) {
+    throw new Error('LoRA adapter is not supported for proxy.');
+  }
+  const adapterData = typeof pathOrBuffer === 'string' ? await loadFile(pathOrBuffer) : pathOrBuffer;
+  return core.createLoraAdapter(adapterData);
+};
+
+export const releaseLoraAdapter = async (adapterId: number): Promise<void> => {
+  if (!BUILD_DEFS.DISABLE_WASM_PROXY && isProxy()) {
+    throw new Error('LoRA adapter is not supported for proxy.');
+  }
+  core.releaseLoraAdapter(adapterId);
+};
+
 export const run = async (
   sessionId: number,
   inputIndices: number[],
@@ -229,8 +247,12 @@ export const run = async (
   outputIndices: number[],
   outputs: Array<TensorMetadata | null>,
   options: InferenceSession.RunOptions,
+  loraAdapterIds: readonly number[],
 ): Promise<TensorMetadata[]> => {
   if (!BUILD_DEFS.DISABLE_WASM_PROXY && isProxy()) {
+    if (loraAdapterIds.length > 0) {
+      throw new Error('LoRA adapter is not supported for proxy.');
+    }
     // check inputs location
     if (inputs.some((t) => t[3] !== 'cpu')) {
       throw new Error('input tensor on GPU is not supported for proxy.');
@@ -250,7 +272,7 @@ export const run = async (
       proxyWorker!.postMessage(message, core.extractTransferableBuffers(serializableInputs));
     });
   } else {
-    return core.run(sessionId, inputIndices, inputs, outputIndices, outputs, options);
+    return core.run(sessionId, inputIndices, inputs, outputIndices, outputs, options, loraAdapterIds);
   }
 };
 

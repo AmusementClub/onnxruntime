@@ -4,6 +4,7 @@
 
 #include <unistd.h>
 #include <algorithm>
+#include <string>
 
 #include "core/providers/cann/cann_utils.h"
 
@@ -229,18 +230,19 @@ bool is_dynamic_shape(const aclmdlIODims& dims) {
 }
 
 namespace fs = std::filesystem;
-std::string RegexMatchFile(const std::string& file_name) {
+std::string MatchFile(const std::string& file_name) {
   fs::path current_dir = fs::current_path();
-  std::regex pattern(file_name);
+
   for (const auto& entry : fs::directory_iterator(current_dir)) {
     if (entry.is_regular_file()) {
       std::string name = entry.path().filename().string();
-      if (std::regex_search(name, pattern)) {
+      if (name.find(file_name) != std::string::npos && entry.path().extension() == ".om") {
         return name;
       }
     }
   }
   return "";
 }
+
 }  // namespace cann
 }  // namespace onnxruntime

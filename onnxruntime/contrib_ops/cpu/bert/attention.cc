@@ -34,6 +34,7 @@ class Attention : public OpKernel, public AttentionCPUBase {
                  /*out*/ PrePackedWeights* prepacked_weights) override;
 
   Status UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+                                   gsl::span<const size_t> /*prepacked_buffer_sizes*/,
                                    int input_idx,
                                    /*out*/ bool& used_shared_buffers) override;
 
@@ -71,7 +72,7 @@ bool Attention<T>::IsPackWeightsSuccessful(int qkv_index,
                                            const T* weights_data,
                                            size_t weight_matrix_col_size,
                                            /*out*/ PrePackedWeights* prepacked_weights) {
-  size_t packb_size = MlasGemmPackBSize(CblasNoTrans, CblasNoTrans, head_size, input_hidden_size);
+  size_t packb_size = MlasGemmPackBSize(CblasNoTrans, CblasNoTrans, head_size, input_hidden_size, &mlas_backend_kernel_selector_config_);
   if (packb_size == 0) {
     return false;
   }
@@ -87,7 +88,7 @@ bool Attention<T>::IsPackWeightsSuccessful(int qkv_index,
   memset(packed_weights_data, 0, packed_weights_data_size);
 
   for (size_t i = 0; i < loop_len; i++) {
-    MlasGemmPackB(CblasNoTrans, CblasNoTrans, head_size, input_hidden_size, weights_data, weight_matrix_col_size, packed_weights_data);
+    MlasGemmPackB(CblasNoTrans, CblasNoTrans, head_size, input_hidden_size, weights_data, weight_matrix_col_size, packed_weights_data, &mlas_backend_kernel_selector_config_);
     packed_weights_data += packb_size;
     weights_data += head_size;
   }
@@ -128,13 +129,14 @@ Status Attention<T>::PrePack(const Tensor& weights, int input_idx, AllocatorPtr 
   size_t q_hidden_size, k_hidden_size, v_hidden_size;
 
   if (qkv_hidden_sizes_.size() != 0) {
+    ORT_RETURN_IF_NOT(qkv_hidden_sizes_.size() == 3,
+                      "qkv_hidden_sizes attribute should have 3 elements");
+    ORT_RETURN_IF_NOT(qkv_hidden_sizes_[0] > 0 && qkv_hidden_sizes_[1] > 0 && qkv_hidden_sizes_[2] > 0,
+                      "qkv_hidden_sizes values should be positive");
+
     q_hidden_size = narrow<size_t>(qkv_hidden_sizes_[0]);
     k_hidden_size = narrow<size_t>(qkv_hidden_sizes_[1]);
     v_hidden_size = narrow<size_t>(qkv_hidden_sizes_[2]);
-
-    if (q_hidden_size == 0 || k_hidden_size == 0 || v_hidden_size == 0) {
-      return Status::OK();
-    }
 
     if (q_hidden_size % num_heads_ != 0 || k_hidden_size % num_heads_ != 0 || v_hidden_size % num_heads_ != 0) {
       return Status::OK();
@@ -153,7 +155,9 @@ Status Attention<T>::PrePack(const Tensor& weights, int input_idx, AllocatorPtr 
   }
 
   const size_t qkv_head_size[3] = {q_hidden_size / num_heads_, k_hidden_size / num_heads_, v_hidden_size / num_heads_};
-  const size_t weight_matrix_col_size = q_hidden_size + k_hidden_size + v_hidden_size;
+  const size_t weight_matrix_col_size = SafeInt<size_t>(q_hidden_size) + k_hidden_size + v_hidden_size;
+  ORT_RETURN_IF_NOT(weight_matrix_col_size == narrow<size_t>(weights_dims[1]),
+                    "Input 'weights' dimension 1 should have same length as sum of Q/K/V hidden sizes");
 
   if (!IsPackWeightsSuccessful(0, alloc, qkv_head_size[0], input_hidden_size,
                                weights_data, weight_matrix_col_size, prepacked_weights) ||
@@ -176,6 +180,7 @@ Status Attention<T>::PrePack(const Tensor& weights, int input_idx, AllocatorPtr 
 
 template <typename T>
 Status Attention<T>::UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+                                               gsl::span<const size_t> /*prepacked_buffer_sizes*/,
                                                int input_idx,
                                                /*out*/ bool& used_shared_buffers) {
   if (1 != input_idx) {
@@ -299,35 +304,36 @@ Status Attention<T>::Compute(OpKernelContext* context) const {
                           packed_weights_size_[qkv_index] * (weights_offset / head_size);
 
           MlasGemm(
-              CblasNoTrans,               // TransA = no
-              sequence_length,            // M      = S
-              head_size,                  // N      = H
-              input_hidden_size,          // K      = D
-              1.0f,                       // alpha
-              input_data + input_offset,  // A
-              input_hidden_size,          // lda    = D
-              packed_weight,              // B
-              1.0f,                       // beta
-              qkv_dest + qkv_offset,      // C
-              head_size,                  // ldc
-              nullptr);                   // use single-thread
+              CblasNoTrans,                            // TransA = no
+              sequence_length,                         // M      = S
+              head_size,                               // N      = H
+              input_hidden_size,                       // K      = D
+              1.0f,                                    // alpha
+              input_data + input_offset,               // A
+              input_hidden_size,                       // lda    = D
+              packed_weight,                           // B
+              1.0f,                                    // beta
+              qkv_dest + qkv_offset,                   // C
+              head_size,                               // ldc
+              nullptr,                                 // use single-thread
+              &mlas_backend_kernel_selector_config_);  // BackendKernelSelectorConfig
         } else {
           math::GemmEx<float, ThreadPool>(
-              CblasNoTrans,                   // TransA = no
-              CblasNoTrans,                   // TransB = no
-              sequence_length,                // M      = S
-              head_size,                      // N      = H
-              input_hidden_size,              // K      = D
-              1.0f,                           // alpha
-              input_data + input_offset,      // A
-              input_hidden_size,              // lda    = D
-              weights_data + weights_offset,  // B
-              qkv_hidden_size,                // ldb    = D + D + D_v
-              1.0f,                           // beta
-              qkv_dest + qkv_offset,          // C
-              head_size,                      // ldc
-              nullptr                         // use single-thread
-          );
+              CblasNoTrans,                            // TransA = no
+              CblasNoTrans,                            // TransB = no
+              sequence_length,                         // M      = S
+              head_size,                               // N      = H
+              input_hidden_size,                       // K      = D
+              1.0f,                                    // alpha
+              input_data + input_offset,               // A
+              input_hidden_size,                       // lda    = D
+              weights_data + weights_offset,           // B
+              qkv_hidden_size,                         // ldb    = D + D + D_v
+              1.0f,                                    // beta
+              qkv_dest + qkv_offset,                   // C
+              head_size,                               // ldc
+              nullptr,                                 // use single-thread
+              &mlas_backend_kernel_selector_config_);  // BackendKernelSelectorConfig
         }
       }
     });

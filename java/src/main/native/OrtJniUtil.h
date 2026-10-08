@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * Licensed under the MIT License.
  */
 #include <jni.h>
@@ -22,6 +22,8 @@ typedef struct {
   ONNXTensorElementDataType onnxTypeEnum;
 } JavaTensorTypeShape;
 
+typedef struct EpContextDataCallbackState EpContextDataCallbackState;
+
 jint JNI_OnLoad(JavaVM *vm, void *reserved);
 
 OrtLoggingLevel convertLoggingLevel(jint level);
@@ -33,6 +35,10 @@ ExecutionMode convertExecutionMode(jint mode);
 OrtSparseFormat convertToOrtSparseFormat(jint format);
 
 jint convertFromOrtSparseFormat(OrtSparseFormat format);
+
+jint convertFromCompiledModelCompatibility(OrtCompiledModelCompatibility compat);
+
+OrtCompiledModelCompatibility convertToCompiledModelCompatibility(jint compat);
 
 jint convertFromONNXDataFormat(ONNXTensorElementDataType type);
 
@@ -85,6 +91,21 @@ jint throwOrtException(JNIEnv *env, int messageId, const char *message);
 jint convertErrorCode(OrtErrorCode code);
 
 OrtErrorCode checkOrtStatus(JNIEnv * env, const OrtApi * api, OrtStatus * status);
+
+EpContextDataCallbackState* createEpContextDataCallbackState(
+    JNIEnv* jniEnv, const OrtApi* api, jobject callback, const char* methodName,
+    const char* methodSignature, size_t maxDataSize);
+
+void releaseEpContextDataCallbackState(JNIEnv* jniEnv, EpContextDataCallbackState* state);
+
+int isEpContextDataReadAllocatorHostAccessible(
+    const OrtApi* api, const OrtMemoryInfo* memoryInfo);
+
+OrtStatus* ORT_API_CALL javaEpContextDataReadCallback(
+    void* state, const char* name, OrtAllocator* allocator, void** buffer, size_t* dataSize);
+
+OrtStatus* ORT_API_CALL javaEpContextDataWriteCallback(
+    void* state, const char* name, const void* buffer, size_t bufferSize);
 
 jsize safecast_size_t_to_jsize(size_t v);
 

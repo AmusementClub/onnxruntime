@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "core/session/plugin_ep/ep_library.h"
+#include "core/session/plugin_ep/ep_library_plugin_utils.h"
 
 namespace onnxruntime {
 /// <summary>
@@ -25,22 +26,30 @@ class EpLibraryPlugin : public EpLibrary {
     return registration_name_.c_str();
   }
 
-  Status Load() override;
-
-  const std::vector<OrtEpFactory*>& GetFactories() override {
-    return factories_;
+  const std::filesystem::path* LibraryPath() const override {
+    return &library_path_;
   }
+
+  Status Load() override;
 
   Status Unload() override;
 
   ORT_DISALLOW_COPY_AND_ASSIGNMENT(EpLibraryPlugin);
 
  private:
+  size_t GetFactoryCount() const override {
+    return factories_.size();
+  }
+
+  OrtEpFactory* GetFactory(size_t index) const override {
+    return factories_[index].get();
+  }
+
   std::mutex mutex_;
   const std::string registration_name_;
   const std::filesystem::path library_path_;
   void* handle_{};
-  std::vector<OrtEpFactory*> factories_{};
+  std::vector<ep_library_plugin_utils::OrtEpFactoryUniquePtr> factories_{};
   CreateEpApiFactoriesFn create_fn_{nullptr};
   ReleaseEpApiFactoryFn release_fn_{nullptr};
 };

@@ -175,6 +175,8 @@ DecoderAttention<T>::DecoderAttention(const OpKernelInfo& info) : CudaKernel(inf
 
 template <typename T>
 Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
+  auto ort_stream = GetOrtStream(context);
+
   const Tensor* query(context->Input<Tensor>(0));
   const Tensor* key(context->Input<Tensor>(1));
   const Tensor* q_weights(context->Input<Tensor>(2));
@@ -234,7 +236,6 @@ Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   typedef typename ToCudaType<T>::MappedType CudaT;
   CudaT one = ToCudaType<T>::FromFloat(1.0f);
-  CudaT zero = ToCudaType<T>::FromFloat(0.0f);
 
   int m = 0, n = 0, k = 0;
   IAllocatorUniquePtr<T> gemm_query_buffer_p(nullptr);
@@ -262,18 +263,15 @@ Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   // calculate q
   gemm_query_buffer_p = GetScratchBuffer<T>(static_cast<size_t>(batch_size) * sequence_length * hidden_size,
-                                            context->GetComputeStream());
+                                            GetComputeStream(context));
   m = sequence_length * batch_size;
   n = hidden_size;
   k = hidden_size;
 
   // TODO(tianleiwu): fuse bias and transpose
   // broadcast bias for query: (h2, S*B)
-  CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
-      cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, 1, &one,
-      reinterpret_cast<const CudaT*>(bias->Data<T>()), n,
-      GetConstOnes<CudaT>(m, Stream(context)), 1,
-      &zero, reinterpret_cast<CudaT*>(gemm_query_buffer_p.get()), n, device_prop, UseTF32()));
+  ORT_RETURN_IF_ERROR(BroadcastBias(stream, reinterpret_cast<const CudaT*>(bias->Data<T>()),
+                                    reinterpret_cast<CudaT*>(gemm_query_buffer_p.get()), m, n, 1, n, one));
   // matmul: (h2, h1)*(h1, S*B)
   CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
       cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one,
@@ -288,17 +286,14 @@ Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
   if (!has_layer_state_ || !use_past_) {
     if (!static_kv_) {
       gemm_kv_buffer_p = GetScratchBuffer<T>(static_cast<size_t>(batch_size) * 2 * sequence_length * hidden_size,
-                                             context->GetComputeStream());
+                                             GetComputeStream(context));
       m = sequence_length * batch_size;
       n = 2 * hidden_size;
       k = hidden_size;
       kv_sequence_length = sequence_length;
       // broadcast bias for key and value: (2*h2, T_S*B)
-      CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
-          cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, 1, &one,
-          reinterpret_cast<const CudaT*>(bias->Data<T>() + hidden_size), n,
-          GetConstOnes<CudaT>(m, Stream(context)), 1,
-          &zero, reinterpret_cast<CudaT*>(gemm_kv_buffer_p.get()), n, device_prop, UseTF32()));
+      ORT_RETURN_IF_ERROR(BroadcastBias(stream, reinterpret_cast<const CudaT*>(bias->Data<T>() + hidden_size),
+                                        reinterpret_cast<CudaT*>(gemm_kv_buffer_p.get()), m, n, 1, n, one));
       // matmul: (2*h2, h1)*(h1, T_S*B)
       CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
           cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one,
@@ -308,17 +303,14 @@ Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
       // gemm_kv_buffer in col-base: (2*h2, T_S*B)
     } else {
       gemm_kv_buffer_p = GetScratchBuffer<T>(static_cast<size_t>(batch_size) * 2 * key_sequence_length * hidden_size,
-                                             context->GetComputeStream());
+                                             GetComputeStream(context));
       m = key_sequence_length * batch_size;
       n = 2 * hidden_size;
       k = hidden_size;
       kv_sequence_length = key_sequence_length;
       // broadcast bias for key and value: (2*h2, T_S*B)
-      CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
-          cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, 1, &one,
-          reinterpret_cast<const CudaT*>(bias->Data<T>() + hidden_size), n,
-          GetConstOnes<CudaT>(m, Stream(context)), 1,
-          &zero, reinterpret_cast<CudaT*>(gemm_kv_buffer_p.get()), n, device_prop, UseTF32()));
+      ORT_RETURN_IF_ERROR(BroadcastBias(stream, reinterpret_cast<const CudaT*>(bias->Data<T>() + hidden_size),
+                                        reinterpret_cast<CudaT*>(gemm_kv_buffer_p.get()), m, n, 1, n, one));
       // matmul: (2*h2, h1)*(h1, T_S*B)
       CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
           cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one,
@@ -334,15 +326,12 @@ Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
     int cache_sequence_length = static_cast<int>(cache_shape[2]);
     if (!static_kv_) {
       gemm_kv_buffer_p = GetScratchBuffer<T>(static_cast<size_t>(batch_size) * 2 * sequence_length * hidden_size,
-                                             context->GetComputeStream());
+                                             GetComputeStream(context));
       m = sequence_length * batch_size;
       kv_sequence_length = cache_sequence_length + sequence_length;
       // broadcast bias for key and value: (2*h2, T_S*B)
-      CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
-          cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, 1, &one,
-          reinterpret_cast<const CudaT*>(bias->Data<T>() + hidden_size), n,
-          GetConstOnes<CudaT>(m, Stream(context)), 1,
-          &zero, reinterpret_cast<CudaT*>(gemm_kv_buffer_p.get()), n, device_prop, UseTF32()));
+      ORT_RETURN_IF_ERROR(BroadcastBias(stream, reinterpret_cast<const CudaT*>(bias->Data<T>() + hidden_size),
+                                        reinterpret_cast<CudaT*>(gemm_kv_buffer_p.get()), m, n, 1, n, one));
       // matmul: (2*h2, h1)*(h1, T_S*B)
       CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
           cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one,
@@ -357,11 +346,11 @@ Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   size_t bytes = element_size * batch_size *
                  (static_cast<size_t>(sequence_length) + static_cast<size_t>(2) * kv_sequence_length) * hidden_size;
-  auto qkv_buffer_p = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+  auto qkv_buffer_p = GetScratchBuffer<void>(bytes, GetComputeStream(context));
 
   bytes = element_size * 2 * batch_size * sequence_length * num_heads_ *
           (static_cast<size_t>(2) * head_size + static_cast<size_t>(kv_sequence_length));
-  auto workspace_p = GetScratchBuffer<void>(bytes, context->GetComputeStream());
+  auto workspace_p = GetScratchBuffer<void>(bytes, GetComputeStream(context));
 
   Tensor* output(context->Output(0, query_shape));
   TensorShape new_cache_shape({batch_size, num_heads_, kv_sequence_length, head_size});
@@ -370,12 +359,8 @@ Status DecoderAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   return LaunchDecoderAttentionKernel(
       device_prop,
-#ifdef USE_ROCM
-      GetTuningContext(),
-#else
       UseTF32(),
-#endif
-      context->GetComputeStream(),
+      ort_stream.get(),
       cublas,
       element_size,
       batch_size,

@@ -4,7 +4,7 @@
 #include "mlas.h"
 #include "benchmark/benchmark.h"
 #include "bench_util.h"
-#include "core/framework/float16.h"
+#include "core/common/float16.h"
 
 using namespace onnxruntime;
 
@@ -45,7 +45,7 @@ void RoPE(benchmark::State& state) {
 }
 
 template <typename T>
-static void RoPEArgs(benchmark::internal::Benchmark* b) {
+static void RoPEArgs(benchmark::Benchmark* b) {
   b->ArgNames({"rotary_emb_dim", "interleaved"});
 
   b->ArgsProduct({

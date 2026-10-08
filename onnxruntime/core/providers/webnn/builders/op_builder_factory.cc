@@ -86,6 +86,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateCumSumOpBuilder("CumSum", op_registrations);
   }
 
+  {  // DepthToSpace
+    CreateDepthToSpaceOpBuilder("DepthToSpace", op_registrations);
+  }
+
   {  // Dropout
     CreateDropoutOpBuilder("Dropout", op_registrations);
   }
@@ -108,12 +112,22 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateGatherOpBuilder("Gather", op_registrations);
   }
 
+  {  // GatherBlockQuantized
+    CreateGatherBlockQuantizedOpBuilder("GatherBlockQuantized", op_registrations);
+  }
+
   {  // GatherElements
     CreateGatherElementsOpBuilder("GatherElements", op_registrations);
   }
 
   {  // GatherND
     CreateGatherNDOpBuilder("GatherND", op_registrations);
+  }
+
+  {  // GroupNorm
+    CreateGroupNormOpBuilder("GroupNormalization", op_registrations);
+    CreateGroupNormOpBuilder("GroupNorm", op_registrations);
+    CreateGroupNormOpBuilder("SkipGroupNorm", op_registrations);
   }
 
   {  // GroupQueryAttention
@@ -152,6 +166,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateLRNOpBuilder("LRN", op_registrations);
   }
 
+  {  // LpNormalization
+    CreateLpNormalizationOpBuilder("LpNormalization", op_registrations);
+  }
+
   {  // LSTM
     CreateLstmOpBuilder("LSTM", op_registrations);
   }
@@ -173,6 +191,7 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateNormalizationOpBuilder("BatchNormalization", op_registrations);
     CreateNormalizationOpBuilder("InstanceNormalization", op_registrations);
     CreateNormalizationOpBuilder("LayerNormalization", op_registrations);
+    CreateNormalizationOpBuilder("SkipLayerNormalization", op_registrations);
     CreateNormalizationOpBuilder("SimplifiedLayerNormalization", op_registrations);
     CreateNormalizationOpBuilder("SkipSimplifiedLayerNormalization", op_registrations);
   }

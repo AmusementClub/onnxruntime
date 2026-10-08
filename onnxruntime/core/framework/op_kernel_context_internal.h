@@ -22,10 +22,12 @@ class OpKernelContextInternal : public OpKernelContext {
                                    const OpKernel& kernel,
                                    const logging::Logger& logger,
                                    const bool& terminate_flag,
-                                   Stream* stream)
+                                   Stream* stream,
+                                   profiling::Profiler* run_profiler = nullptr)
       : OpKernelContext(&frame, &kernel, stream, session_state.GetThreadPool(), logger),
         session_state_(session_state),
-        terminate_flag_(terminate_flag) {
+        terminate_flag_(terminate_flag),
+        run_profiler_(run_profiler) {
     const auto& implicit_inputs = kernel.Node().ImplicitInputDefs();
     int num_implicit_inputs = static_cast<int>(implicit_inputs.size());
     implicit_input_values_.reserve(num_implicit_inputs);
@@ -51,6 +53,23 @@ class OpKernelContextInternal : public OpKernelContext {
     return session_state_.GetUseDeterministicCompute();
   }
 
+#if !defined(ORT_MINIMAL_BUILD)
+  KernelPilot* GetKernelPilot() const override {
+    kernel_pilot_ = session_state_.GetKernelPilot(GetKernel());
+    return kernel_pilot_;
+  }
+
+  // Called by the executor only after successful Compute(). To commit usage, Compute() must obtain
+  // the pilot via GetKernelPilot(), then BeginInvocation() and collect its selection before returning.
+  // Without a lookup this is a no-op; KernelPilot::RecordUsage() also checks for a pending invocation.
+  Status RecordKernelUsage() const {
+    if (kernel_pilot_ == nullptr) {
+      return Status::OK();
+    }
+    return kernel_pilot_->RecordUsage();
+  }
+#endif
+
   const SessionState* SubgraphSessionState(const std::string& attribute_name) {
     return session_state_.GetSubgraphSessionState(GetNodeIndex(), attribute_name);
   }
@@ -61,6 +80,10 @@ class OpKernelContextInternal : public OpKernelContext {
 
   OrtValue* GetOutputMLValue(int index) {
     return OpKernelContext::GetOutputMLValue(index);
+  }
+
+  OrtValue* GetPreallocatedOutputMLValue(int index) const {
+    return OpKernelContext::GetPreallocatedOutputMLValue(index);
   }
 
 #ifdef ENABLE_ATEN
@@ -104,8 +127,12 @@ class OpKernelContextInternal : public OpKernelContext {
 
   const bool& GetTerminateFlag() const noexcept { return terminate_flag_; }
 
+  profiling::Profiler* GetRunProfiler() const noexcept { return run_profiler_; }
+
  private:
 #if !defined(ORT_MINIMAL_BUILD)
+  mutable KernelPilot* kernel_pilot_{nullptr};
+
   class AccountingAllocator : public IAllocator {
    public:
     AccountingAllocator(AllocatorPtr alloc) : IAllocator(alloc->Info()), allocator_(std::move(alloc)) {
@@ -137,6 +164,7 @@ class OpKernelContextInternal : public OpKernelContext {
 
   const SessionState& session_state_;
   const bool& terminate_flag_;
+  profiling::Profiler* run_profiler_;
   std::vector<const OrtValue*> implicit_input_values_;
 };
 

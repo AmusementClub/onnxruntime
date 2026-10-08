@@ -160,8 +160,11 @@ static Status ProcessIndicesInput(QnnModelWrapper& qnn_model_wrapper,
   }
 
   // Insert QNN Cast op to convert dynamic indices from int64 to int32.
+  const auto& input_tensorwrapper = qnn_model_wrapper.GetQnnTensorWrapper(indices_tensor_name);
+
   std::string indices_casted_name{indices_tensor_name};
-  if (indices_info.qnn_data_type == QNN_DATATYPE_INT_64) {
+  // Check QNN Tensor data type.
+  if (input_tensorwrapper.GetTensorDataType() == QNN_DATATYPE_INT_64) {
     assert(!indices_info.is_initializer);
     indices_casted_name += "_int32";
     if (qnn_model_wrapper.IsQnnTensorWrapperExist(indices_casted_name)) {
@@ -296,10 +299,13 @@ Status GatherOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_w
     }
   }
 
+  // Store the cast input name to ensure consistency
+  std::string cast_input_name;
+
   // If a cast to int64 is needed, add the cast node
   if (needs_int64_cast) {
     const std::string cast_node_name = utils::GetUniqueName(node_unit, "_cast_int64");
-    const std::string cast_input_name = utils::GetUniqueName(output_name, "_cast_int64");
+    cast_input_name = utils::GetUniqueName(output_name, "_cast_int64");
     const std::string cast_output_name = output_name;
 
     // Create the cast input tensor wrapper
@@ -321,7 +327,8 @@ Status GatherOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_w
   if (reshape_required) {
     gather_output_name = utils::GetUniqueName(output_name, "_reshape");
   } else if (needs_int64_cast) {
-    gather_output_name = utils::GetUniqueName(output_name, "_cast_int64");
+    // Use the previously stored cast_input_name for consistency
+    gather_output_name = cast_input_name;
   }
 
   Qnn_TensorType_t tensor_type = (!reshape_required && is_graph_output) ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE;
@@ -346,8 +353,8 @@ Status GatherOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_w
     std::string node_output_name = output_name;
 
     if (needs_int64_cast) {
-      // If needs_int64 is true, the output name should be the input name of the cast node
-      node_output_name = utils::GetUniqueName(output_name, "_cast_int64");
+      // If needs_int64 is true, use the previously stored cast_input_name for consistency
+      node_output_name = cast_input_name;
     }
     ORT_RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(utils::GetUniqueName(node_unit, QNN_OP_RESHAPE),
                                                       QNN_OP_PACKAGE_NAME_QTI_AISW,
@@ -367,7 +374,8 @@ Status GatherOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_w
                                                         QNN_OP_CAST,
                                                         {cast_node_info.input_name},
                                                         {cast_node_info.output_name},
-                                                        {}),
+                                                        {},
+                                                        do_op_validation),
                         " Failed to add Cast node");
     }
   }

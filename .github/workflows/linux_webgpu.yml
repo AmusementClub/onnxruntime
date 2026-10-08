@@ -2,9 +2,9 @@ name: Linux WebGPU CI
 
 on:
   push:
-    branches: [main, 'rel-*']
+    branches: [main, 'rel-*', 'plugin-ep-webgpu/rel-*']
   pull_request:
-    branches: [main, 'rel-*']
+    branches: [main, 'rel-*', 'plugin-ep-webgpu/rel-*']
   workflow_dispatch:
 
 concurrency:
@@ -33,6 +33,29 @@ jobs:
       run_tests: false
       upload_build_output: true
       execution_providers: 'webgpu'
+      job_identifier: build-linux-webgpu-x64-release
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Pass token for reusable workflow needs (e.g., docker build action)
+
+  # Builds the same WebGPU plugin EP sources linked into the ORT binary rather than as a separate
+  # shared library. Build-only, like the job above; this exists mainly to compile the static plugin
+  # configuration with GCC as well as MSVC. See docs/design/webgpu_ep_extraction/
+  # plugin_boundary_and_web_integration/static_plugin_ep_registration_design.md
+  build-linux-webgpu-static-plugin-x64-release:
+    name: Build Linux WebGPU Static Plugin x64 Release
+    uses: ./.github/workflows/reusable_linux_build.yml
+    with:
+      pool_name: "onnxruntime-github-Ubuntu2204-AMD-CPU" # Build pool
+      build_config: Release
+      architecture: x64
+      dockerfile_path: tools/ci_build/github/linux/docker/Dockerfile.manylinux2_28_webgpu
+      docker_image_repo: onnxruntimecpubuildpythonx64
+      extra_build_flags: '--use_binskim_compliant_compile_flags --build_wheel --use_webgpu static_plugin --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=ON'
+      python_path_prefix: 'PATH=/opt/python/cp310-cp310/bin:$PATH'
+      run_tests: false
+      upload_build_output: false
+      execution_providers: 'webgpu'
+      job_identifier: build-linux-webgpu-static-plugin-x64-release
     secrets:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Pass token for reusable workflow needs (e.g., docker build action)
 
@@ -51,7 +74,7 @@ jobs:
   #     - name: Checkout code
   #       uses: actions/checkout@v4
 
-  #     - uses: microsoft/onnxruntime-github-actions/build-docker-image@v0.0.7
+  #     - uses: microsoft/onnxruntime-github-actions/build-docker-image@v0.0.9
   #       id: build_docker_image_step
   #       with:
   #         dockerfile: ${{ github.workspace }}/tools/ci_build/github/linux/docker/Dockerfile.manylinux2_28_webgpu
@@ -91,7 +114,7 @@ jobs:
 
   #     - name: Test ONNX Runtime
   #       id: test_step
-  #       uses: microsoft/onnxruntime-github-actions/run-build-script-in-docker@v0.0.7
+  #       uses: microsoft/onnxruntime-github-actions/run-build-script-in-docker@v0.0.9
   #       with:
   #         docker_image: ${{ steps.build_docker_image_step.outputs.full-image-name }}
   #         build_config: Release

@@ -1,37 +1,54 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include "core/framework/op_kernel.h"
-
 #include "core/providers/webgpu/compute_context.h"
-#include "core/providers/webgpu/webgpu_context.h"
-#include "core/providers/webgpu/allocator.h"
-#include "core/providers/webgpu/buffer_manager.h"
+#include "core/framework/tensor.h"
 #include "core/providers/webgpu/webgpu_execution_provider.h"
 
 namespace onnxruntime {
 namespace webgpu {
-ComputeContext::ComputeContext(OpKernelContext& kernel_context, const WebGpuExecutionProvider& ep)
-    : webgpu_context_{WebGpuContextFactory::GetContext(kernel_context.GetDeviceId())},
-      kernel_context_{kernel_context},
-      ep_{ep} {
+
+ComputeContextBase::ComputeContextBase(WebGpuContext& webgpu_context,
+                                       const WebGpuExecutionProvider& ep,
+                                       const OpKernel& op_kernel)
+    : webgpu_context_{webgpu_context},
+      ep_{ep},
+      op_kernel_{op_kernel} {
 }
 
-void ComputeContext::PushErrorScope() {
-  if (webgpu_context_.ValidationMode() >= ValidationMode::Full) {
-    webgpu_context_.PushErrorScope();
-  }
+const webgpu::BufferManager& ComputeContextBase::BufferManagerAccessor::Get(const ComputeContextBase& context) {
+  return context.ep_.BufferManager();
 }
 
-Status ComputeContext::PopErrorScope() {
-  if (webgpu_context_.ValidationMode() >= ValidationMode::Full) {
-    return webgpu_context_.PopErrorScope();
-  }
-  return Status::OK();
+CommandRecordingState& ComputeContextBase::BufferManagerAccessor::GetRecording(const ComputeContextBase& context) {
+  return context.ep_.Recording();
 }
 
-const webgpu::BufferManager& ComputeContext::BufferManager() const {
-  return ep_.BufferManager();
+ComputeContext::ComputeContext(WebGpuContext& webgpu_context,
+                               const WebGpuExecutionProvider& ep,
+                               const OpKernel& op_kernel,
+                               OpKernelContext& kernel_context)
+    : ComputeContextBase(webgpu_context, ep, op_kernel),
+      kernel_context_{kernel_context} {
+}
+
+// Native test targets also include compute_context.h but do not use the EP adapter types.
+Tensor ComputeContext::CreateGPUTensor(MLDataType data_type, const TensorShape& shape) {
+  AllocatorPtr allocator;
+  ORT_THROW_IF_ERROR(kernel_context_.GetTempSpaceAllocator(&allocator));
+#if defined(ORT_USE_EP_API_ADAPTERS)
+  const size_t bytes = Tensor::CalculateTensorStorageSize(data_type, shape);
+  // For performance, use the kernel's stream: plain Alloc during Run immediately flushes cached-buffer
+  // clears, causing frequent submissions when scratch allocations reuse cached buffers.
+  // A null stream still falls back to plain Alloc's immediate-submission policy.
+  auto buffer = IAllocator::MakeUniquePtr<void>(
+      allocator, bytes, false, reinterpret_cast<Stream*>(kernel_context_.GetSyncStream()));
+  Tensor tensor(data_type, shape, buffer.get(), allocator);
+  buffer.release();
+  return tensor;
+#else
+  return {data_type, shape, allocator};
+#endif
 }
 
 }  // namespace webgpu

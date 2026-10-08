@@ -12,10 +12,11 @@
 #include <gsl/gsl>
 #include "core/common/common.h"
 #include "core/common/exceptions.h"
-#include "core/framework/endian.h"
-#include "core/framework/float8.h"
-#include "core/framework/float16.h"
+#include "core/common/endian.h"
+#include "core/common/float8.h"
+#include "core/common/float16.h"
 #include "core/framework/int4.h"
+#include "core/framework/int2.h"
 #include "core/framework/float4.h"
 #include "core/graph/onnx_protobuf.h"
 #include "core/framework/to_tensor_proto_element_type.h"
@@ -182,7 +183,7 @@ class DataTypeImpl {
   static MLDataType GetOptionalType();
 
   /**
-   * Convert an ONNX TypeProto to onnxruntime DataTypeImpl.
+   * Return the MLDataType (const DataTypeImpl*) for an ONNX TypeProto.
    * However, this conversion is lossy. Don't try to use 'this->GetTypeProto()' converting it back.
    * Even though GetTypeProto() will not have the original information, it will still have enough to correctly
    * map to MLDataType.
@@ -190,6 +191,7 @@ class DataTypeImpl {
    */
   static MLDataType TypeFromProto(const ONNX_NAMESPACE::TypeProto& proto);
 
+  // These functions take TensorProto::DataType numbers, not ONNXTensorElementDataType.
   static const TensorTypeBase* TensorTypeFromONNXEnum(int type);
   static const SequenceTensorTypeBase* SequenceTensorTypeFromONNXEnum(int type);
 #if !defined(DISABLE_SPARSE_TENSORS)
@@ -211,6 +213,7 @@ class DataTypeImpl {
   static const std::vector<MLDataType>& AllTensorTypesIRv9();
   static const std::vector<MLDataType>& AllTensorTypesIRv10();
   static const std::vector<MLDataType>& AllTensorTypesIRv11();
+  static const std::vector<MLDataType>& AllTensorTypesIRv13();
 
   static const std::vector<MLDataType>& AllFixedSizeTensorTypes();  // up to IR4 (no float 8), deprecated
   static const std::vector<MLDataType>& AllFixedSizeTensorTypesIRv4();
@@ -285,10 +288,10 @@ template <typename T>
 struct IsTensorContainedType : public IsAnyOf<T, float, uint8_t, int8_t, uint16_t, int16_t,
                                               int32_t, int64_t, std::string, bool, MLFloat16,
                                               double, uint32_t, uint64_t, BFloat16,
-                                              Int4x2, UInt4x2
+                                              Int4x2, UInt4x2, Int2x4, UInt2x4
 #if !defined(DISABLE_FLOAT8_TYPES)
                                               ,
-                                              Float8E4M3FN, Float8E4M3FNUZ, Float8E5M2, Float8E5M2FNUZ
+                                              Float8E4M3FN, Float8E4M3FNUZ, Float8E5M2, Float8E5M2FNUZ, Float8E8M0
 #endif
 #if !defined(DISABLE_FLOAT4_TYPES)
                                               ,
@@ -304,10 +307,11 @@ struct IsTensorContainedType : public IsAnyOf<T, float, uint8_t, int8_t, uint16_
 template <typename T>
 struct IsSparseTensorContainedType : public IsAnyOf<T, float, uint8_t, int8_t, uint16_t, int16_t,
                                                     int32_t, int64_t, std::string, bool, MLFloat16,
-                                                    double, uint32_t, uint64_t, BFloat16
+                                                    double, uint32_t, uint64_t, BFloat16,
+                                                    Int4x2, UInt4x2, Int2x4, UInt2x4
 #if !defined(DISABLE_FLOAT8_TYPES)
                                                     ,
-                                                    Float8E4M3FN, Float8E4M3FNUZ, Float8E5M2, Float8E5M2FNUZ
+                                                    Float8E4M3FN, Float8E4M3FNUZ, Float8E5M2, Float8E5M2FNUZ, Float8E8M0
 #endif
 #if !defined(DISABLE_FLOAT4_TYPES)
                                                     ,
@@ -929,8 +933,9 @@ class OpaqueType : public NonTensorType<T> {
  * \brief PrimitiveDataTypeBase
  *        Base class for primitive Tensor contained types
  *
- * \details This class contains an integer constant that can be
- *          used for input data type dispatching. This class also stores the number of subelements per size units.
+ * \details The integer returned by GetDataType() uses ONNX TensorProto::DataType numbering,
+ *          not the C API's ONNXTensorElementDataType numbering, and is used for input type dispatching.
+ *          This class also stores the number of subelements per size units.
  *          Example: For float4/int4, the size unit is 1 byte and the number of subelements is 2.
  *
  */

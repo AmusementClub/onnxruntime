@@ -17,9 +17,11 @@
 
 #include "core/util/math_cpuonly.h"
 #include "core/util/math.h"
-#include "core/framework/float16.h"
+#include "core/common/float16.h"
+#include "core/common/inlined_containers.h"
 
 #include <algorithm>
+#include <cmath>
 #include <type_traits>
 #include "core/common/narrow.h"
 #include "core/mlas/inc/mlas.h"
@@ -38,11 +40,12 @@ namespace onnxruntime {
 namespace math {
 
 // MatMul implementation purely based on Eigen.
-#define EIGEN_MATMUL_FUNCTION(T)                                                                                  \
-  template <>                                                                                                     \
-  void MatMul<T>(ptrdiff_t M, ptrdiff_t N, ptrdiff_t K, const T* A, const T* B, T* C, concurrency::ThreadPool*) { \
-    auto C_mat = EigenMatrixMap<T>(C, N, M);                                                                      \
-    C_mat.noalias() = ConstEigenMatrixMap<T>(B, N, K) * ConstEigenMatrixMap<T>(A, K, M);                          \
+#define EIGEN_MATMUL_FUNCTION(T)                                                                                \
+  template <>                                                                                                   \
+  void MatMul<T>(ptrdiff_t M, ptrdiff_t N, ptrdiff_t K, const T* A, const T* B, T* C, concurrency::ThreadPool*, \
+                 const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG*) {                                                  \
+    auto C_mat = EigenMatrixMap<T>(C, N, M);                                                                    \
+    C_mat.noalias() = ConstEigenMatrixMap<T>(B, N, K) * ConstEigenMatrixMap<T>(A, K, M);                        \
   }
 
 EIGEN_MATMUL_FUNCTION(int32_t)
@@ -75,16 +78,17 @@ EIGEN_MATMUL_FUNCTION(uint64_t)
 template <>
 void Gemm<float, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M,
                              ptrdiff_t N, ptrdiff_t K, float alpha, const float* A, const float* B, float beta,
-                             float* C, ThreadPool* threadpool) {
+                             float* C, ThreadPool* threadpool, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
   int lda = static_cast<int>((TransA == CblasNoTrans) ? K : M);
   int ldb = static_cast<int>((TransB == CblasNoTrans) ? N : K);
-  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, threadpool);
+  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, threadpool, mlas_backend_kernel_selector_config);
 }
 
 template <>
 void Gemm<Eigen::half, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M,
                                    ptrdiff_t N, ptrdiff_t K, Eigen::half alpha, const Eigen::half* A, const Eigen::half* B, Eigen::half beta,
-                                   Eigen::half* C, ThreadPool*) {
+                                   Eigen::half* C, ThreadPool*, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  ORT_UNUSED_PARAMETER(mlas_backend_kernel_selector_config);
   auto C_mat = EigenMatrixMap<Eigen::half>(C, N, M);
   if (beta == static_cast<Eigen::half>(0)) {
     C_mat.setZero();
@@ -129,7 +133,8 @@ void Gemm<Eigen::half, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE Trans
 template <>
 void Gemm<double, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M,
                               ptrdiff_t N, ptrdiff_t K, double alpha, const double* A, const double* B, double beta,
-                              double* C, ThreadPool* threadpool) {
+                              double* C, ThreadPool* threadpool, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  ORT_UNUSED_PARAMETER(mlas_backend_kernel_selector_config);
   int lda = static_cast<int>((TransA == CblasNoTrans) ? K : M);
   int ldb = static_cast<int>((TransB == CblasNoTrans) ? N : K);
   MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, threadpool);
@@ -138,7 +143,8 @@ void Gemm<double, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, pt
 template <>
 void Gemm<double, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M,
                               ptrdiff_t N, ptrdiff_t K, double alpha, const double* A, const double* B, double beta,
-                              double* C, ThreadPool*) {
+                              double* C, ThreadPool*, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  ORT_UNUSED_PARAMETER(mlas_backend_kernel_selector_config);
   auto C_mat = EigenMatrixMap<double>(C, N, M);
   if (beta == 0) {
     C_mat.setZero();
@@ -181,13 +187,55 @@ void Gemm<double, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, pt
 #endif
 
 template <>
-void MatMul<float>(ptrdiff_t M, ptrdiff_t N, ptrdiff_t K, const float* A, const float* B, float* C, ThreadPool* threadpool) {
-  MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool);
+void MatMul<float>(ptrdiff_t M, ptrdiff_t N, ptrdiff_t K, const float* A, const float* B, float* C, ThreadPool* threadpool,
+                   const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool, mlas_backend_kernel_selector_config);
+}
+
+template <>
+void MatMul<MLFloat16>(ptrdiff_t M, ptrdiff_t N, ptrdiff_t K, const MLFloat16* A, const MLFloat16* B, MLFloat16* C, ThreadPool* threadpool,
+                       const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  // Guard against using generic half GEMM when no accelerated implementation is
+  // available. Native packing support currently also signals an accelerated
+  // backend path.
+  const bool has_accelerated_half_gemm =
+      MlasFp16AccelerationSupported() ||
+      MlasHalfGemmNativePackBSize(CblasNoTrans, CblasNoTrans,
+                                  static_cast<size_t>(N), static_cast<size_t>(K),
+                                  mlas_backend_kernel_selector_config) != 0;
+  if (has_accelerated_half_gemm) {
+    MLAS_HALF_GEMM_DATA_PARAMS data{};
+    data.A = A;
+    data.lda = static_cast<size_t>(K);
+    data.B = B;
+    data.ldb = static_cast<size_t>(N);
+    data.C = C;
+    data.ldc = static_cast<size_t>(N);
+    data.BackendKernelSelectorConfig = mlas_backend_kernel_selector_config;
+    MlasHalfGemmBatch(static_cast<size_t>(M), static_cast<size_t>(N), static_cast<size_t>(K), 1, &data, threadpool);
+    return;
+  }
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif
+  auto C_mat = EigenMatrixMap<Eigen::half>(reinterpret_cast<Eigen::half*>(C), N, M);
+  // Accumulate the fallback in fp32 and round only the result to fp16.
+  C_mat.noalias() =
+      (ConstEigenMatrixMap<Eigen::half>(reinterpret_cast<const Eigen::half*>(B), N, K).cast<float>() *
+       ConstEigenMatrixMap<Eigen::half>(reinterpret_cast<const Eigen::half*>(A), K, M).cast<float>())
+          .cast<Eigen::half>();
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 #ifdef MLAS_SUPPORTS_GEMM_DOUBLE
 template <>
-void MatMul<double>(ptrdiff_t M, ptrdiff_t N, ptrdiff_t K, const double* A, const double* B, double* C, ThreadPool* threadpool) {
+void MatMul<double>(ptrdiff_t M, ptrdiff_t N, ptrdiff_t K, const double* A, const double* B, double* C, ThreadPool* threadpool,
+                    const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  ORT_UNUSED_PARAMETER(mlas_backend_kernel_selector_config);
   MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool);
 }
 #else
@@ -197,14 +245,82 @@ EIGEN_MATMUL_FUNCTION(double)
 template <>
 void GemmEx<float, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M, ptrdiff_t N, ptrdiff_t K,
                                float alpha, const float* A, int lda, const float* B, int ldb, float beta, float* C,
-                               int ldc, ThreadPool* threadpool) {
+                               int ldc, ThreadPool* threadpool, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, threadpool, mlas_backend_kernel_selector_config);
+}
+
+#ifdef MLAS_SUPPORTS_GEMM_DOUBLE
+template <>
+void GemmEx<double, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M, ptrdiff_t N, ptrdiff_t K,
+                                double alpha, const double* A, int lda, const double* B, int ldb, double beta, double* C,
+                                int ldc, ThreadPool* threadpool, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  ORT_UNUSED_PARAMETER(mlas_backend_kernel_selector_config);
   MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, threadpool);
 }
+#else
+template <>
+void GemmEx<double, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M, ptrdiff_t N, ptrdiff_t K,
+                                double alpha, const double* A, int lda, const double* B, int ldb, double beta, double* C,
+                                int ldc, ThreadPool*, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  ORT_UNUSED_PARAMETER(mlas_backend_kernel_selector_config);
+  auto C_mat = EigenMatrixMapWithStrides<double>(C, N, M, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(ldc, 1));
+  if (beta == 0) {
+    C_mat.setZero();
+  } else {
+    C_mat *= beta;
+  }
+  switch (TransA) {
+    case CblasNoTrans: {
+      switch (TransB) {
+        case CblasNoTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMapWithStrides<double>(
+                                          B, N, K, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(ldb, 1)) *
+                                      ConstEigenMatrixMapWithStrides<double>(
+                                          A, K, M, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(lda, 1)));
+          return;
+        case CblasTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMapWithStrides<double>(
+                                          B, K, N, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(ldb, 1))
+                                          .transpose() *
+                                      ConstEigenMatrixMapWithStrides<double>(
+                                          A, K, M, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(lda, 1)));
+          return;
+        default:
+          ORT_THROW("CblasNoTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
+      }
+    }
+    case CblasTrans: {
+      switch (TransB) {
+        case CblasNoTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMapWithStrides<double>(
+                                          B, N, K, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(ldb, 1)) *
+                                      ConstEigenMatrixMapWithStrides<double>(
+                                          A, M, K, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(lda, 1))
+                                          .transpose());
+          return;
+        case CblasTrans:
+          C_mat.noalias() += alpha * (ConstEigenMatrixMapWithStrides<double>(
+                                          B, K, N, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(ldb, 1))
+                                          .transpose() *
+                                      ConstEigenMatrixMapWithStrides<double>(
+                                          A, M, K, Eigen::Stride<Eigen::Dynamic, Eigen::Dynamic>(lda, 1))
+                                          .transpose());
+          return;
+        default:
+          ORT_THROW("CblasTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
+      }
+    }
+    default:
+      ORT_THROW("Unexpected CBLAS_TRANSPOSE for TransA of ", TransA);
+  }
+}
+#endif
 
 template <>
 void GemmEx<MLFloat16, ThreadPool>(CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB, ptrdiff_t M, ptrdiff_t N, ptrdiff_t K,
                                    MLFloat16 alpha, const MLFloat16* A, int lda, const MLFloat16* B, int ldb, MLFloat16 beta,
-                                   MLFloat16* C, int ldc, ThreadPool*) {
+                                   MLFloat16* C, int ldc, ThreadPool*, const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* mlas_backend_kernel_selector_config) {
+  ORT_UNUSED_PARAMETER(mlas_backend_kernel_selector_config);
   // The following function is not implemented for MLFloat16 in Mlas.
   // MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, threadpool);
   // Threadpool is not used.
@@ -485,6 +601,58 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
     T* data_col,
     bool accumulate_output,
     T padding_value) {
+  if (!accumulate_output && rank > 0) {
+    const ptrdiff_t last = rank - 1;
+    const int64_t width = im_shape[last];
+    const int64_t row_size = output_shape[last];
+    const int64_t step = stride[last];
+    InlinedVector<int64_t> offsets(rank);
+    InlinedVector<int64_t> position(last, 0);
+    for (int64_t c = 0; c < channels_col; ++c) {
+      int64_t channel = c;
+      for (ptrdiff_t d = last; d >= 0; --d) {
+        offsets[d] = (channel % kernel_shape[d]) * dilation[d] - pad[d];
+        channel /= kernel_shape[d];
+      }
+      const int64_t first_col = offsets[last] < 0
+                                    ? std::min(row_size, -(offsets[last] + 1) / step + 1)
+                                    : 0;
+      const int64_t first_x = offsets[last] < 0
+                                  ? step - 1 - (-(offsets[last] + 1) % step)
+                                  : offsets[last];
+      const int64_t count = first_col == row_size || first_x >= width
+                                ? 0
+                                : std::min(row_size - first_col, (width - 1 - first_x) / step + 1);
+      do {
+        int64_t index = channel;
+        bool valid = count > 0;
+        for (ptrdiff_t d = 0; valid && d < last; ++d) {
+          const int64_t coordinate = position[d] * stride[d] + offsets[d];
+          valid = is_a_ge_zero_and_a_lt_b(coordinate, im_shape[d]);
+          if (valid) {
+            index = index * im_shape[d] + coordinate;
+          }
+        }
+        if (valid) {
+          std::fill_n(data_col, first_col, padding_value);
+          const T* src = data_im + index * width + first_x;
+          T* dst = data_col + first_col;
+          if (step == 1) {
+            std::copy_n(src, count, dst);
+          } else {
+            for (int64_t x = 0; x < count; ++x) {
+              dst[x] = src[x * step];
+            }
+          }
+          std::fill_n(dst + count, row_size - first_col - count, padding_value);
+        } else {
+          std::fill_n(data_col, row_size, padding_value);
+        }
+        data_col += row_size;
+      } while (NextPosition(last, output_shape, position.data()));
+    }
+    return;
+  }
   int64_t kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
   std::vector<int64_t> d_offset(rank, 0);
   std::vector<int64_t> d_iter(rank, 0);
@@ -527,6 +695,7 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
 
 template struct Im2col<float, StorageOrder::NCHW>;
 template struct Im2col<uint8_t, StorageOrder::NCHW>;
+template struct Im2col<int8_t, StorageOrder::NCHW>;
 
 template <typename T>
 void Im2col<T, StorageOrder::NHWC>::operator()(
@@ -769,6 +938,7 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
 template struct Im2col<int8_t, StorageOrder::NHWC>;
 template struct Im2col<uint8_t, StorageOrder::NHWC>;
 template struct Im2col<MLFloat16, StorageOrder::NHWC>;
+template struct Im2col<float, StorageOrder::NHWC>;
 
 template <>
 void Col2im<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, int64_t channels, int64_t height,
@@ -783,11 +953,31 @@ void Col2im<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, int64
   const int64_t output_hw = output_h * output_w;
   const int64_t hw = height * width;
   const int64_t hwc = hw * channels;
-  Set<float, CPUMathUtil>(narrow<ptrdiff_t>(hwc), 0, data_im, context);
 
   // Fast path for zero padding and no dilation
   // From Torch, modified THNN_(unfolded_acc)
   if (dilation_h == 1 && dilation_w == 1 && pad_l == 0 && pad_r == 0 && pad_t == 0 && pad_b == 0) {
+    if (kernel_h == 2 && kernel_w == 2 && stride_h == 2 && stride_w == 2 &&
+        height % 2 == 0 && width % 2 == 0) {
+      // Each output has one input value. Write adjacent values together,
+      // without an output read or a separate zero fill.
+      for (int64_t c = 0; c < channels; ++c) {
+        for (int64_t h = 0; h < output_h; ++h) {
+          const float* src = data_col + c * 4 * output_hw + h * output_w;
+          float* dst = data_im + c * hw + h * 2 * width;
+          for (int64_t w = 0; w < output_w; ++w) {
+            // Keep the addition to positive zero for signed-zero behavior.
+            dst[2 * w] = 0.0f + src[w];
+            dst[2 * w + 1] = 0.0f + src[output_hw + w];
+            dst[width + 2 * w] = 0.0f + src[2 * output_hw + w];
+            dst[width + 2 * w + 1] = 0.0f + src[3 * output_hw + w];
+          }
+        }
+      }
+      return;
+    }
+
+    Set<float, CPUMathUtil>(narrow<ptrdiff_t>(hwc), 0, data_im, context);
     // Src (column) data cursor
     auto* src = data_col;
     // End of dst (image) data
@@ -825,6 +1015,7 @@ void Col2im<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, int64
   }
 
   // Fallback
+  Set<float, CPUMathUtil>(narrow<ptrdiff_t>(hwc), 0, data_im, context);
 
   // Src (col data) cursor
   auto* src = data_col;
@@ -840,6 +1031,18 @@ void Col2im<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, int64
       int64_t w_offset = -pad_l;
       int64_t w_offset_end = w_offset + kernel_w * dilation_w;
       for (; w_offset < w_offset_end; w_offset += dilation_w) {
+        // The valid source columns are the same for each row of this kernel element.
+        const int64_t first_col = w_offset < 0 ? std::min(output_w, -(w_offset + 1) / stride_w + 1) : 0;
+        if (first_col == output_w) {
+          src += output_hw;
+          continue;
+        }
+        const int64_t first_w = w_offset + first_col * stride_w;
+        if (first_w >= width) {
+          src += output_hw;
+          continue;
+        }
+        const int64_t count = std::min(output_w - first_col, (width - 1 - first_w) / stride_w + 1);
         // End of src channel data
         auto* src_ce = src + output_hw;
         // Dst row offset
@@ -847,14 +1050,11 @@ void Col2im<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, int64
           // End of src row data
           auto* src_we = src + output_w;
           if (is_a_ge_zero_and_a_lt_b(h, hw)) {
-            for (int64_t w = w_offset; src < src_we; src++, w += stride_w) {
-              if (is_a_ge_zero_and_a_lt_b(w, width)) {
-                dst[h + w] += *src;
-              }
+            for (int64_t col = 0; col < count; ++col) {
+              dst[h + first_w + col * stride_w] += src[first_col + col];
             }
-          } else {
-            src = src_we;
           }
+          src = src_we;
         }
       }
     }
@@ -901,18 +1101,79 @@ void Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, con
                                                       const int64_t* dilation, const int64_t* pad, ptrdiff_t N,
                                                       float* data_img, CPUMathUtil* context) {
   Set<float, CPUMathUtil>(narrow<ptrdiff_t>(img_size), 0, data_img, context);
-  Im2col<float, StorageOrder::NCHW>()(
-      data_col,
-      img_shape,
-      output_shape,
-      channels_col,
-      kernel_shape,
-      stride,
-      dilation,
-      pad,
-      N,
-      data_img,
-      true);
+  if (N == 0) {
+    Im2col<float, StorageOrder::NCHW>()(data_col, img_shape, output_shape, channels_col,
+                                        kernel_shape, stride, dilation, pad, N, data_img, true);
+    return;
+  }
+  const ptrdiff_t last = N - 1;
+  const int64_t width = img_shape[last];
+  const int64_t row_size = output_shape[last];
+  const int64_t step = stride[last];
+  const int64_t column_size = std::accumulate(output_shape, output_shape + N, int64_t{1}, std::multiplies<int64_t>());
+  InlinedVector<int64_t> offsets(N);
+  InlinedVector<int64_t> position(last, 0);
+  for (int64_t c = 0; c < channels_col; ++c) {
+    int64_t kernel_index = c;
+    for (ptrdiff_t d = last; d >= 0; --d) {
+      offsets[d] = (kernel_index % kernel_shape[d]) * dilation[d] - pad[d];
+      kernel_index /= kernel_shape[d];
+    }
+    const int64_t first_col = offsets[last] < 0
+                                  ? std::min(row_size, -(offsets[last] + 1) / step + 1)
+                                  : 0;
+    if (first_col == row_size) {
+      continue;
+    }
+    const int64_t first_x = offsets[last] < 0
+                                ? step - 1 - (-(offsets[last] + 1) % step)
+                                : offsets[last];
+    if (first_x >= width) {
+      continue;
+    }
+    const int64_t count = std::min(row_size - first_col, (width - 1 - first_x) / step + 1);
+    const float* row = data_col + c * column_size;
+    do {
+      int64_t img_index = kernel_index;
+      bool valid = true;
+      for (ptrdiff_t d = 0; d < last; ++d) {
+        const int64_t coordinate = position[d] * stride[d] + offsets[d];
+        if (!is_a_ge_zero_and_a_lt_b(coordinate, img_shape[d])) {
+          valid = false;
+          break;
+        }
+        img_index = img_index * img_shape[d] + coordinate;
+      }
+      if (valid) {
+        const float* src = row + first_col;
+        float* dst = data_img + img_index * width + first_x;
+        if (step == 1) {
+          for (int64_t x = 0; x < count; ++x) {
+            dst[x] += src[x];
+          }
+        } else {
+          for (int64_t x = 0; x < count; ++x) {
+            dst[x * step] += src[x];
+          }
+        }
+      }
+      row += row_size;
+    } while (NextPosition(last, output_shape, position.data()));
+  }
+  bool may_overlap = false;
+  for (ptrdiff_t d = 0; d < N; ++d) {
+    if (kernel_shape[d] - 1 > (stride[d] - 1) / dilation[d]) {
+      may_overlap = true;
+      break;
+    }
+  }
+  // A single contribution has no competing NaN payload. For overlapping windows,
+  // use the original loop to preserve NaN payloads after vectorized additions.
+  if (may_overlap && std::any_of(data_img, data_img + img_size, [](float value) { return std::isnan(value); })) {
+    Set<float, CPUMathUtil>(narrow<ptrdiff_t>(img_size), 0, data_img, context);
+    Im2col<float, StorageOrder::NCHW>()(data_col, img_shape, output_shape, channels_col,
+                                        kernel_shape, stride, dilation, pad, N, data_img, true);
+  }
 }
 
 #define SPECIALIZED_COPYVECTOR(T)                                                          \

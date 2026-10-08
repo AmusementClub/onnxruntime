@@ -7,6 +7,7 @@
 #include "core/optimizer/graph_transformer_utils.h"
 #include "core/optimizer/initializer.h"
 #include "core/optimizer/matmul_add_fusion.h"
+#include "core/optimizer/utils.h"
 
 #include <string>
 #include <string_view>
@@ -194,7 +195,7 @@ Status MatMulAddFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
         shape_initializer_proto.add_dims(static_cast<int64_t>(shape.size()));
         shape_initializer_proto.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT64);
         utils::SetRawDataInTensorProto(shape_initializer_proto, shape.data(), shape.size() * sizeof(int64_t));
-        NodeArg* shape_arg = &graph_utils::AddInitializer(graph, shape_initializer_proto);
+        NodeArg* shape_arg = &graph_utils::AddInitializerWithOrtValue(graph, shape_initializer_proto);
         ONNX_NAMESPACE::TypeProto new_arg_type;
         const ONNX_NAMESPACE::TensorProto_DataType element_type = static_cast<ONNX_NAMESPACE::TensorProto_DataType>(
             gemm_input_defs[0]->TypeAsProto()->tensor_type().elem_type());
@@ -204,7 +205,8 @@ Status MatMulAddFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
         NodeArg* new_arg = &graph.GetOrCreateNodeArg(graph.GenerateNodeArgName(name + "_reshape_arg"), &new_arg_type);
         Node& reshape_node = graph.AddNode(graph.GenerateNodeName(name + "_reshape"), "Reshape", "Reshape for " + name,
                                            {is_input ? gemm_input_defs[0] : new_arg, shape_arg},
-                                           {is_input ? new_arg : gemm_output_defs[0]});
+                                           {is_input ? new_arg : gemm_output_defs[0]},
+                                           matmul_node);
         reshape_node.SetExecutionProviderType(matmul_node.GetExecutionProviderType());
         return &reshape_node;
       };
@@ -217,7 +219,8 @@ Status MatMulAddFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
     }
 
     Node& gemm_node = graph.AddNode(graph.GenerateNodeName(matmul_node.Name() + "/MatMulAddFusion"), "Gemm",
-                                    "fused Matmul and Add", gemm_input_defs, gemm_output_defs);
+                                    "fused Matmul and Add", gemm_input_defs, gemm_output_defs,
+                                    matmul_node);
     gemm_node.SetExecutionProviderType(matmul_node.GetExecutionProviderType());
 
     if (need_reshape) {
@@ -249,8 +252,10 @@ Status MatMulAddFusion::ApplyImpl(Graph& graph, bool& modified, int graph_level,
     graph_utils::GraphEdge::RemoveGraphEdges(graph, add_input_edges);
     graph_utils::RemoveNodeOutputEdges(graph, matmul_node);
     graph_utils::ReplaceDownstreamNodeInput(graph, add_node, 0, *output_node, 0);
-    graph.RemoveNode(matmul_node.Index());
-    graph.RemoveNode(add_node.Index());
+    const std::array source_node_indices{matmul_node.Index(), add_node.Index()};
+    graph.RemoveNode(source_node_indices[0]);
+    graph.RemoveNode(source_node_indices[1]);
+    graph.NotifyNodeReplacement(source_node_indices, gemm_node.Index());
 
     modified = true;
   }

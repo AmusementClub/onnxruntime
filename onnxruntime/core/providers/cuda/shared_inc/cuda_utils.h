@@ -7,13 +7,13 @@
 #pragma once
 
 #include <cuda_fp16.h>
-#include <memory>
+#include <limits>
 #include <type_traits>
 #include <vector>
-#include <limits>
 
 #include <gsl/gsl>
-#include "core/framework/float16.h"
+#include "core/common/float16.h"
+#include "core/common/status.h"
 #include "core/providers/cuda/shared_inc/fast_divmod.h"
 
 namespace onnxruntime {
@@ -34,17 +34,14 @@ enum class BroadcastIndexType : int32_t {
 };
 
 template <typename T>
-class IConstantBuffer {
- public:
-  virtual ~IConstantBuffer() {};
-  virtual const T* GetBuffer(cudaStream_t stream, size_t count) = 0;
-};
-
-template <typename T>
-std::unique_ptr<IConstantBuffer<T>> CreateConstantOnes();
-
-template <typename T>
 void Fill(cudaStream_t stream, T* output, T value, int64_t count);
+
+// Broadcast a scalar, row, column, or matrix bias into a row-major [rows, cols] output.
+// Each bias dimension must be either 1 or the corresponding output dimension.
+// A unit scale copies values without arithmetic; non-unit scaling is used by zero-K Gemm.
+template <typename T>
+Status BroadcastBias(cudaStream_t stream, const T* bias, T* output, int rows, int cols,
+                     int bias_rows, int bias_cols, T scale);
 
 /*
   This is a utility wrapper for arbitrary type array
@@ -53,11 +50,7 @@ void Fill(cudaStream_t stream, T* output, T value, int64_t count);
 */
 template <typename T, int32_t capacity = 8>
 struct TArray {
-#if defined(USE_ROCM)
-#define TARRAY_CONSTRUCTOR_SPECIFIERS __host__ __device__
-#else
 #define TARRAY_CONSTRUCTOR_SPECIFIERS
-#endif
 
   TARRAY_CONSTRUCTOR_SPECIFIERS TArray() = default;
   TARRAY_CONSTRUCTOR_SPECIFIERS TArray(const TArray&) = default;
@@ -141,6 +134,17 @@ struct NumericLimits<half> {
 #else
     return 65504.0f;
 #endif
+  }
+};
+
+template <>
+struct NumericLimits<BFloat16> {
+  __inline__ __host__ __device__ static BFloat16 Lowest() {
+    return BFloat16::FromBits(0xFF7FU);  // -3.38953139e38
+  }
+
+  __inline__ __host__ __device__ static BFloat16 Max() {
+    return BFloat16::FromBits(0x7F7FU);  // 3.38953139e38
   }
 };
 

@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "core/common/inlined_containers.h"
+#include "core/common/make_string.h"
 #include "core/common/path_string.h"
 #include "core/common/string_helper.h"
 
@@ -23,12 +24,15 @@
 #include "core/framework/model_metadef_id_generator.h"
 #include "core/framework/murmurhash3.h"
 #include "core/framework/node_unit.h"
+#include "core/framework/op_kernel_context_internal.h"
 #include "core/framework/provider_options.h"
 #include "core/framework/provider_shutdown.h"
 #include "core/framework/random_generator.h"
+#include "core/framework/run_instrumentation.h"
 #include "core/framework/run_options.h"
 #include "core/framework/sparse_utils.h"
 #include "core/framework/tensorprotoutils.h"
+#include "core/framework/tensor_external_data_info.h"
 #include "core/framework/TensorSeq.h"
 #include "core/graph/constants.h"
 #include "core/graph/graph_proto_serializer.h"
@@ -91,9 +95,9 @@ using EtwRegistrationManager_EtwInternalCallback = EtwRegistrationManager::EtwIn
 
 #include "core/common/cpuid_info.h"
 #include "core/common/logging/logging.h"
+
 #include "core/providers/shared_library/provider_interfaces.h"
 #include "core/providers/partitioning_utils.h"
-
 #include "core/providers/cuda/cuda_provider_factory_creator.h"
 #include "core/providers/cann/cann_provider_factory_creator.h"
 #include "core/providers/dnnl/dnnl_provider_factory_creator.h"
@@ -116,6 +120,10 @@ using EtwRegistrationManager_EtwInternalCallback = EtwRegistrationManager::EtwIn
 #include "core/providers/dnnl/dnnl_provider_options.h"
 #include "core/providers/nv_tensorrt_rtx/nv_provider_factory.h"
 #include "core/providers/nv_tensorrt_rtx/nv_provider_options.h"
+
+#if defined(_WIN32) && !defined(NDEBUG) && defined(ONNXRUNTIME_ENABLE_MEMLEAK_CHECK)
+#include "core/platform/windows/debug_alloc.h"
+#endif
 
 #if !defined(ORT_MINIMAL_BUILD) &&                                        \
     (defined(USE_TENSORRT) || defined(USE_TENSORRT_PROVIDER_INTERFACE) || \
@@ -166,6 +174,25 @@ struct TensorShapeProto_Dimension_Iterator_Impl : TensorShapeProto_Dimension_Ite
   const ONNX_NAMESPACE::TensorShapeProto_Dimension& operator*() override { return *v_; }
 
   google::protobuf::internal::RepeatedPtrIterator<const onnx::TensorShapeProto_Dimension> v_;
+};
+
+struct TensorProto_ConstIterator_Impl : TensorProto_ConstIterator {
+  explicit TensorProto_ConstIterator_Impl(google::protobuf::internal::RepeatedPtrIterator<const ONNX_NAMESPACE::TensorProto>&& v) : v_{std::move(v)} {}
+
+  bool operator!=(const TensorProto_ConstIterator& p) const override { return v_ != static_cast<const TensorProto_ConstIterator_Impl*>(&p)->v_; }
+
+  void operator++() override { v_.operator++(); }
+  const ONNX_NAMESPACE::TensorProto& operator*() const override { return *v_; }
+
+  google::protobuf::internal::RepeatedPtrIterator<const ONNX_NAMESPACE::TensorProto> v_;
+};
+
+struct TensorProto_Iterator_Impl : TensorProto_Iterator {
+  explicit TensorProto_Iterator_Impl(google::protobuf::internal::RepeatedPtrIterator<ONNX_NAMESPACE::TensorProto>&& v) : v_{std::move(v)} {}
+  bool operator!=(const TensorProto_Iterator& p) const override { return v_ != reinterpret_cast<const TensorProto_Iterator_Impl*>(&p)->v_; }
+  void operator++() override { v_.operator++(); }
+  ONNX_NAMESPACE::TensorProto& operator*() const override { return *v_; }
+  google::protobuf::internal::RepeatedPtrIterator<ONNX_NAMESPACE::TensorProto> v_;
 };
 
 struct NodeAttributes_Iterator_Impl : NodeAttributes_Iterator {
@@ -259,8 +286,13 @@ struct ProviderHostImpl : ProviderHost {
     return Status::OK();
   };
 
+#if defined(_WIN32) && !defined(NDEBUG) && defined(ONNXRUNTIME_ENABLE_MEMLEAK_CHECK)
+  void* HeapAllocate(size_t size) override { return DebugHeapAlloc(size, 1); }
+  void HeapFree(void* p) override { DebugHeapFree(p); }
+#else
   void* HeapAllocate(size_t size) override { return new uint8_t[size]; }
   void HeapFree(void* p) override { delete[] reinterpret_cast<uint8_t*>(p); }
+#endif
 
   logging::Logger* LoggingManager_GetDefaultLogger() override {
     return const_cast<logging::Logger*>(&logging::LoggingManager::DefaultLogger());
@@ -516,6 +548,7 @@ struct ProviderHostImpl : ProviderHost {
 
   // TypeProto (wrapped)
   std::unique_ptr<ONNX_NAMESPACE::TypeProto> TypeProto__construct() override { return std::make_unique<ONNX_NAMESPACE::TypeProto>(); }
+  void TypeProto__operator_delete(ONNX_NAMESPACE::TypeProto* p) override { delete p; }
   void TypeProto__CopyFrom(ONNX_NAMESPACE::TypeProto* p, const ONNX_NAMESPACE::TypeProto* other) override { p->CopyFrom(*other); }
   bool TypeProto__has_tensor_type(const ONNX_NAMESPACE::TypeProto* p) override { return p->has_tensor_type(); }
   const ONNX_NAMESPACE::TypeProto_Tensor& TypeProto__tensor_type(const ONNX_NAMESPACE::TypeProto* p) override { return p->tensor_type(); }
@@ -593,7 +626,14 @@ struct ProviderHostImpl : ProviderHost {
   std::string* GraphProto__mutable_name(ONNX_NAMESPACE::GraphProto* p) override { return p->mutable_name(); }
   ONNX_NAMESPACE::NodeProto* GraphProto__mutable_node(ONNX_NAMESPACE::GraphProto* p, int index) override { return p->mutable_node(index); }
 
-  void GraphProto__operator_assign(ONNX_NAMESPACE::GraphProto* p, const ONNX_NAMESPACE::GraphProto& v) override { *p = v; }
+  ONNX_NAMESPACE::GraphProto& GraphProto__operator_assign(ONNX_NAMESPACE::GraphProto* p, const ONNX_NAMESPACE::GraphProto& v) override {
+    *p = v;
+    return *p;
+  }
+  ONNX_NAMESPACE::GraphProto& GraphProto__operator_move_assign(ONNX_NAMESPACE::GraphProto* p, ONNX_NAMESPACE::GraphProto&& v) override {
+    *p = std::move(v);
+    return *p;
+  }
 
   void GraphProto__set_name(ONNX_NAMESPACE::GraphProto* p, const std::string& name) override { p->set_name(name); }
   void GraphProto__set_doc_string(ONNX_NAMESPACE::GraphProto* p, const std::string& doc_str) override {
@@ -632,7 +672,14 @@ struct ProviderHostImpl : ProviderHost {
   // TensorProto (wrapped)
   std::unique_ptr<ONNX_NAMESPACE::TensorProto> TensorProto__construct() override { return std::make_unique<ONNX_NAMESPACE::TensorProto>(); }
   void TensorProto__operator_delete(ONNX_NAMESPACE::TensorProto* p) override { delete p; }
-  void TensorProto__operator_assign(ONNX_NAMESPACE::TensorProto* p, const ONNX_NAMESPACE::TensorProto& v) override { *p = v; }
+  ONNX_NAMESPACE::TensorProto& TensorProto__operator_assign(ONNX_NAMESPACE::TensorProto* p, const ONNX_NAMESPACE::TensorProto& v) override {
+    *p = v;
+    return *p;
+  }
+  ONNX_NAMESPACE::TensorProto& TensorProto__operator_move_assign(ONNX_NAMESPACE::TensorProto* p, ONNX_NAMESPACE::TensorProto&& v) override {
+    *p = std::move(v);
+    return *p;
+  }
   bool TensorProto__has_name(const ONNX_NAMESPACE::TensorProto* p) override { return p->has_name(); }
   void TensorProto__set_name(ONNX_NAMESPACE::TensorProto* p, const ::std::string& name) override { p->set_name(name); }
   const ::std::string& TensorProto__name(const ONNX_NAMESPACE::TensorProto* p) override { return p->name(); }
@@ -662,8 +709,20 @@ struct ProviderHostImpl : ProviderHost {
 
   // TensorProtos (wrapped)
   ONNX_NAMESPACE::TensorProto* TensorProtos__Add(ONNX_NAMESPACE::TensorProtos* p) override { return p->Add(); }
-  int TensorProtos__size(ONNX_NAMESPACE::TensorProtos* p) override { return p->size(); }
+  int TensorProtos__size(const ONNX_NAMESPACE::TensorProtos* p) override { return p->size(); }
   ONNX_NAMESPACE::TensorProto& TensorProtos__at(ONNX_NAMESPACE::TensorProtos* p, int index) override { return p->at(index); };
+  std::unique_ptr<TensorProto_ConstIterator> TensorProtos__begin(const ONNX_NAMESPACE::TensorProtos* p) override {
+    return std::make_unique<TensorProto_ConstIterator_Impl>(p->begin());
+  }
+  std::unique_ptr<TensorProto_ConstIterator> TensorProtos__end(const ONNX_NAMESPACE::TensorProtos* p) override {
+    return std::make_unique<TensorProto_ConstIterator_Impl>(p->end());
+  }
+  std::unique_ptr<TensorProto_Iterator> TensorProtos__begin(ONNX_NAMESPACE::TensorProtos* p) override {
+    return std::make_unique<TensorProto_Iterator_Impl>(p->begin());
+  }
+  std::unique_ptr<TensorProto_Iterator> TensorProtos__end(ONNX_NAMESPACE::TensorProtos* p) override {
+    return std::make_unique<TensorProto_Iterator_Impl>(p->end());
+  }
 
   // TensorShapeProto_Dimension (wrapped)
   int TensorShapeProto_Dimension__value_case(const ONNX_NAMESPACE::TensorShapeProto_Dimension* p) override { return p->value_case(); }
@@ -816,6 +875,11 @@ struct ProviderHostImpl : ProviderHost {
   const std::unordered_map<std::string, std::string>& SessionOptions__GetConfigOptionsMap(const OrtSessionOptions* p) override { return p->value.config_options.configurations; }
   const ConfigOptions& SessionOptions__GetConfigOptions(const OrtSessionOptions* p) override { return p->value.config_options; }
   bool SessionOptions__GetEnableProfiling(const OrtSessionOptions* p) override { return p->value.enable_profiling; };
+  void SessionOptions__GetEpContextDataCallbacks(const OrtSessionOptions* p,
+                                                 OrtReadNamedBufferFunc* read_func, void** read_state,
+                                                 OrtWriteNamedBufferFunc* write_func, void** write_state) override {
+    p->GetEpContextDataCallbacks(read_func, read_state, write_func, write_state);
+  }
   // ComputeCapability (wrapped)
   std::unique_ptr<ComputeCapability> ComputeCapability__construct(std::unique_ptr<IndexedSubGraph> t_sub_graph) override { return std::make_unique<ComputeCapability>(std::move(t_sub_graph)); }
   void ComputeCapability__operator_delete(ComputeCapability* p) override { delete p; }
@@ -955,6 +1019,8 @@ struct ProviderHostImpl : ProviderHost {
 
   MLDataType DataTypeImpl__GetType_Int4x2() override { return DataTypeImpl::GetType<Int4x2>(); }
   MLDataType DataTypeImpl__GetType_UInt4x2() override { return DataTypeImpl::GetType<UInt4x2>(); }
+  MLDataType DataTypeImpl__GetType_Int2x4() override { return DataTypeImpl::GetType<Int2x4>(); }
+  MLDataType DataTypeImpl__GetType_UInt2x4() override { return DataTypeImpl::GetType<UInt2x4>(); }
 
   MLDataType DataTypeImpl__GetTensorTypeFromOnnxType(int onnx_type) override { return DataTypeImpl::TensorTypeFromONNXEnum(onnx_type)->AsTensorType(); }
   MLDataType DataTypeImpl__GetTensorType_bool() override { return DataTypeImpl::GetTensorType<bool>(); }
@@ -984,6 +1050,8 @@ struct ProviderHostImpl : ProviderHost {
 
   MLDataType DataTypeImpl__GetTensorType_Int4x2() override { return DataTypeImpl::GetTensorType<Int4x2>(); }
   MLDataType DataTypeImpl__GetTensorType_UInt4x2() override { return DataTypeImpl::GetTensorType<UInt4x2>(); }
+  MLDataType DataTypeImpl__GetTensorType_Int2x4() override { return DataTypeImpl::GetTensorType<Int2x4>(); }
+  MLDataType DataTypeImpl__GetTensorType_UInt2x4() override { return DataTypeImpl::GetTensorType<UInt2x4>(); }
 
 #if !defined(DISABLE_SPARSE_TENSORS)
   MLDataType DataTypeImpl__GetSparseTensorType_bool() override { return DataTypeImpl::GetSparseTensorType<bool>(); }
@@ -1235,11 +1303,21 @@ struct ProviderHostImpl : ProviderHost {
     return onnxruntime::utils::HasExternalDataInMemory(ten_proto);
   }
 
+  Status Utils__ValidateExternalDataPath(const std::filesystem::path& model_path,
+                                         const std::filesystem::path& external_data_path) override {
+    return onnxruntime::utils::ValidateExternalDataPath(model_path, external_data_path);
+  }
+
+  Status Utils__ValidateExternalDataPathFromDir(const std::filesystem::path& model_dir,
+                                                const std::filesystem::path& external_data_path) override {
+    return onnxruntime::utils::ValidateExternalDataPathFromDir(model_dir, external_data_path);
+  }
+
   // Model (wrapped)
   std::unique_ptr<Model> Model__construct(ONNX_NAMESPACE::ModelProto&& model_proto, const PathString& model_path,
                                           const IOnnxRuntimeOpSchemaRegistryList* local_registries,
                                           const logging::Logger& logger) override {
-    return std::make_unique<Model>(model_proto, model_path, local_registries, logger);
+    return std::make_unique<Model>(std::move(model_proto), model_path, local_registries, logger);
   }
   std::unique_ptr<Model> Model__construct(const std::string& graph_name,
                                           bool is_onnx_domain_only,
@@ -1433,12 +1511,31 @@ struct ProviderHostImpl : ProviderHost {
 
   NodeArg& GraphUtils__AddInitializerWithExternalData(Graph& graph,
                                                       const ONNX_NAMESPACE::TensorProto& new_initializer) override {
-    return graph_utils::AddInitializerWithExternalData(graph, new_initializer);
+    return graph_utils::AddInitializerWithOrtValue(graph, new_initializer);
   }
 
   void GraphUtils__MakeInitializerCopyIfNotExist(const Graph& src_graph, Graph& dst_graph,
                                                  const std::string& name, bool load_in_memory) override {
     graph_utils::MakeInitializerCopyIfNotExist(src_graph, dst_graph, name, load_in_memory);
+  }
+
+  // ExternalDataInfo (wrapped)
+  void ExternalDataInfo__operator_delete(ExternalDataInfo* p) override { delete p; }
+  const PathString& ExternalDataInfo__GetRelPath(const ExternalDataInfo* p) const override {
+    return p->GetRelPath();
+  }
+  int64_t ExternalDataInfo__GetOffset(const ExternalDataInfo* p) const override {
+    return narrow<int64_t>(p->GetOffset());
+  }
+  size_t ExternalDataInfo__GetLength(const ExternalDataInfo* p) const override {
+    return p->GetLength();
+  }
+  const std::string& ExternalDataInfo__GetChecksum(const ExternalDataInfo* p) const override {
+    return p->GetChecksum();
+  }
+  Status ExternalDataInfo__Create(const ONNX_NAMESPACE::StringStringEntryProtos& input,
+                                  std::unique_ptr<ExternalDataInfo>& out) override {
+    return ExternalDataInfo::Create(input, out);
   }
 
   // Initializer (wrapped)
@@ -1477,14 +1574,14 @@ struct ProviderHostImpl : ProviderHost {
 
   void* Initializer__mutable_data(Initializer& initializer, int data_type) override {
     if (data_type != initializer.data_type()) {
-      throw std::invalid_argument("Initializer mutable data type mismatch");
+      ORT_THROW_EX(std::invalid_argument, "Initializer mutable data type mismatch");
     }
     return initializer.mutable_data_raw();
   }
 
   const void* Initializer__data(const Initializer& initializer, int data_type) override {
     if (data_type != initializer.data_type()) {
-      throw std::invalid_argument("Initializer data type mismatch");
+      ORT_THROW_EX(std::invalid_argument, "Initializer data type mismatch");
     }
     return initializer.data_raw();
   }
@@ -1526,7 +1623,46 @@ struct ProviderHostImpl : ProviderHost {
   bool OpKernelContext__TryGetInferredOutputShape(const OpKernelContext* p, int index, TensorShape& shape) override { return p->TryGetInferredOutputShape(index, shape); }
   bool OpKernelContext__TryGetInferredInputShape(const OpKernelContext* p, int index, TensorShape& shape) override { return p->TryGetInferredInputShape(index, shape); }
   Stream* OpKernelContext__GetComputeStream(const OpKernelContext* p) override { return p->GetComputeStream(); }
-
+  const RunInstrumentationContext* OpKernelContext__GetRunInstrumentationContext(
+      const OpKernelContext*) override {
+    return nullptr;
+  }
+  const std::string& RunInstrumentationContext__RequestId(const RunInstrumentationContext*) override {
+    static const std::string empty;
+    return empty;
+  }
+  TimePoint RunInstrumentationContext__StartProfiling(const RunInstrumentationContext*) override {
+    return {};
+  }
+  uint64_t RunInstrumentationContext__ProfilerStartTimeNs(const RunInstrumentationContext*) override {
+    return 0;
+  }
+  void RunInstrumentationContext__AddDeferredRecord(
+      const RunInstrumentationContext*,
+      std::unique_ptr<DeferredRunInstrumentationRecord>) override {
+  }
+  bool RunInstrumentationContext__TryReserveMoeRoutingRecord(
+      const RunInstrumentationContext*, size_t) override {
+    return false;
+  }
+  void RunInstrumentationContext__RecordMoeRoutingEvent(
+      const RunInstrumentationContext*,
+      const TimePoint&,
+      const TimePoint&,
+      const std::string&,
+      NodeIndex,
+      const std::string&,
+      std::string,
+      std::string,
+      int64_t,
+      int64_t,
+      int,
+      int64_t,
+      const std::string&) override {
+  }
+  KernelPilot* OpKernelContext__GetKernelPilot(const OpKernelContext* p) override {
+    return p->GetKernelPilot();
+  }
   // OpKernelInfo (wrapped)
   std::unique_ptr<OpKernelInfo> CopyOpKernelInfo(const OpKernelInfo& info) override { return onnxruntime::CopyOpKernelInfo(info); }
   void OpKernelInfo__operator_delete(OpKernelInfo* p) override { delete p; }
@@ -1609,6 +1745,8 @@ struct ProviderHostImpl : ProviderHost {
 
   Int4x2* Tensor__MutableData_Int4x2(Tensor* p) override { return p->MutableData<Int4x2>(); }
   UInt4x2* Tensor__MutableData_UInt4x2(Tensor* p) override { return p->MutableData<UInt4x2>(); }
+  Int2x4* Tensor__MutableData_Int2x4(Tensor* p) override { return p->MutableData<Int2x4>(); }
+  UInt2x4* Tensor__MutableData_UInt2x4(Tensor* p) override { return p->MutableData<UInt2x4>(); }
 
   const bool* Tensor__Data_bool(const Tensor* p) override { return p->Data<bool>(); }
   const int8_t* Tensor__Data_int8(const Tensor* p) override { return p->Data<int8_t>(); }
@@ -1637,8 +1775,11 @@ struct ProviderHostImpl : ProviderHost {
 
   const Int4x2* Tensor__Data_Int4x2(const Tensor* p) override { return p->Data<Int4x2>(); }
   const UInt4x2* Tensor__Data_UInt4x2(const Tensor* p) override { return p->Data<UInt4x2>(); }
+  const Int2x4* Tensor__Data_Int2x4(const Tensor* p) override { return p->Data<Int2x4>(); }
+  const UInt2x4* Tensor__Data_UInt2x4(const Tensor* p) override { return p->Data<UInt2x4>(); }
 
   gsl::span<const int64_t> Tensor__DataAsSpan_int64(const Tensor* p) override { return p->DataAsSpan<int64_t>(); }
+  gsl::span<const int32_t> Tensor__DataAsSpan_int32(const Tensor* p) override { return p->DataAsSpan<int32_t>(); }
 
   void* Tensor__MutableDataRaw(Tensor* p, MLDataType type) override { return p->MutableDataRaw(type); }
   const void* Tensor__DataRaw(const Tensor* p, MLDataType type) override { return p->DataRaw(type); }
@@ -1673,6 +1814,8 @@ struct ProviderHostImpl : ProviderHost {
 
   bool Tensor__IsDataType_Int4x2(const Tensor* p) noexcept override { return p->IsDataType<Int4x2>(); }
   bool Tensor__IsDataType_UInt4x2(const Tensor* p) noexcept override { return p->IsDataType<UInt4x2>(); }
+  bool Tensor__IsDataType_Int2x4(const Tensor* p) noexcept override { return p->IsDataType<Int2x4>(); }
+  bool Tensor__IsDataType_UInt2x4(const Tensor* p) noexcept override { return p->IsDataType<UInt2x4>(); }
 
   const TensorShape& Tensor__Shape(const Tensor* p) override { return p->Shape(); }
   void Tensor__Reshape(Tensor* p, const TensorShape& new_shape) override { return p->Reshape(new_shape); }
@@ -1774,24 +1917,44 @@ struct ProviderHostImpl : ProviderHost {
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_MINIMAL_BUILD_CUSTOM_OPS)
   Status LoadDynamicLibrary(onnxruntime::PathString library_name) override { return LoadDynamicLibraryFromProvider(library_name); };
 #endif
-} provider_host_;
+
+  // Float8E8M0 support — appended at end to preserve vtable ABI compatibility
+#if !defined(DISABLE_FLOAT8_TYPES)
+  MLDataType DataTypeImpl__GetType_Float8E8M0() override { return DataTypeImpl::GetType<Float8E8M0>(); }
+  MLDataType DataTypeImpl__GetTensorType_Float8E8M0() override { return DataTypeImpl::GetTensorType<Float8E8M0>(); }
+#if !defined(DISABLE_SPARSE_TENSORS)
+  MLDataType DataTypeImpl__GetSparseTensorType_Float8E8M0() override { return DataTypeImpl::GetSparseTensorType<Float8E8M0>(); }
+#endif
+  Float8E8M0* Tensor__MutableData_Float8E8M0(Tensor* p) override { return p->MutableData<Float8E8M0>(); }
+  const Float8E8M0* Tensor__Data_Float8E8M0(const Tensor* p) override { return p->Data<Float8E8M0>(); }
+  bool Tensor__IsDataType_Float8E8M0(const Tensor* p) noexcept override { return p->IsDataType<Float8E8M0>(); }
+#endif
+} g_provider_host;
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma warning(pop)
 #endif
 struct ProviderSharedLibrary {
-  void Ensure() {
-    if (handle_)
-      return;
+  Status Initialize() {
+    if (handle_) {
+      return Status::OK();
+    }
 
     auto full_path = Env::Default().GetRuntimePath() +
                      PathString(LIBRARY_PREFIX ORT_TSTR("onnxruntime_providers_shared") LIBRARY_EXTENSION);
-    ORT_THROW_IF_ERROR(Env::Default().LoadDynamicLibrary(full_path, true /*shared_globals on unix*/, &handle_));
+    ORT_RETURN_IF_ERROR(Env::Default().LoadDynamicLibrary(full_path, true /*shared_globals on unix*/, &handle_));
 
     void (*PProvider_SetHost)(void*);
-    ORT_THROW_IF_ERROR(Env::Default().GetSymbolFromLibrary(handle_, "Provider_SetHost", (void**)&PProvider_SetHost));
+    auto status = Env::Default().GetSymbolFromLibrary(handle_, "Provider_SetHost", (void**)&PProvider_SetHost);
+    if (!status.IsOK()) {
+      LogRuntimeError(0, status, __FILE__, static_cast<const char*>(__FUNCTION__), __LINE__);
+      Unload();
+      return status;
+    }
 
-    PProvider_SetHost(&provider_host_);
+    PProvider_SetHost(&g_provider_host);
+
+    return Status::OK();
   }
 
   void Unload() {
@@ -1817,10 +1980,12 @@ struct ProviderSharedLibrary {
 
 static ProviderSharedLibrary s_library_shared;
 
-bool InitProvidersSharedLibrary() try {
-  s_library_shared.Ensure();
-  return true;
-} catch (const std::exception&) {
+bool InitProvidersSharedLibrary() {
+  ORT_TRY {
+    return s_library_shared.Initialize().IsOK();
+  }
+  ORT_CATCH(const std::exception&) {
+  }
   return false;
 }
 
@@ -1837,10 +2002,10 @@ Status ProviderLibrary::Load() {
     return Status::OK();
   }
 
-  try {
+  ORT_TRY {
     std::lock_guard<std::mutex> lock{mutex_};
     if (!provider_) {
-      s_library_shared.Ensure();
+      ORT_RETURN_IF_ERROR(s_library_shared.Initialize());
 
       if (absolute_) {
         // If filename_ is not absolute it should not be loaded.
@@ -1854,20 +2019,25 @@ Status ProviderLibrary::Load() {
       }
 
       Provider* (*PGetProvider)();
-      ORT_RETURN_IF_ERROR(Env::Default().GetSymbolFromLibrary(handle_, "GetProvider", (void**)&PGetProvider));
+      auto status = Env::Default().GetSymbolFromLibrary(handle_, "GetProvider", (void**)&PGetProvider);
+      if (!status.IsOK()) {
+        Unload();
+        return status;
+      }
 
       provider_ = PGetProvider();
     }
-  } catch (const std::exception&) {
+  }
+  ORT_CATCH(const std::exception&) {
     Unload();  // If anything fails we unload the library and rethrow
-    throw;
+    ORT_RETHROW;
   }
 
   return Status::OK();
 }
 
 Provider& ProviderLibrary::Get() {
-  try {
+  ORT_TRY {
     if (!initialized_) {
       if (!provider_) {
         ORT_THROW_IF_ERROR(Load());
@@ -1879,12 +2049,12 @@ Provider& ProviderLibrary::Get() {
       }
       initialized_ = true;
     }
-
-    return *provider_;
-  } catch (const std::exception&) {
-    Unload();  // If anything fails we unload the library and rethrow
-    throw;
   }
+  ORT_CATCH(const std::exception&) {
+    Unload();  // If anything fails we unload the library and rethrow
+    ORT_RETHROW;
+  }
+  return *provider_;
 }
 
 void ProviderLibrary::Unload() {
@@ -2013,23 +2183,31 @@ OrtCUDAProviderOptionsV2 OrtCUDAProviderOptionsToOrtCUDAProviderOptionsV2(const 
   return cuda_options_converted;
 }
 
+// Loading a shared-library EP can fail (missing library, incompatible build). The factory and
+// provider-info accessors below log and return nullptr in that case instead of propagating.
+#define ORT_CATCH_LOG_RETURN_NULLPTR           \
+  ORT_CATCH(const std::exception& exception) { \
+    ORT_HANDLE_EXCEPTION([&]() {               \
+      LOGS_DEFAULT(ERROR) << exception.what(); \
+    });                                        \
+    return nullptr;                            \
+  }
+
 std::shared_ptr<IExecutionProviderFactory> CudaProviderFactoryCreator::Create(
-    const OrtCUDAProviderOptions* provider_options) try {
-  OrtCUDAProviderOptionsV2 cuda_options_converted = onnxruntime::OrtCUDAProviderOptionsToOrtCUDAProviderOptionsV2(provider_options);
-  return s_library_cuda.Get().CreateExecutionProviderFactory(&cuda_options_converted);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    const OrtCUDAProviderOptions* provider_options) {
+  ORT_TRY {
+    OrtCUDAProviderOptionsV2 cuda_options_converted = onnxruntime::OrtCUDAProviderOptionsToOrtCUDAProviderOptionsV2(provider_options);
+    return s_library_cuda.Get().CreateExecutionProviderFactory(&cuda_options_converted);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 std::shared_ptr<IExecutionProviderFactory> CudaProviderFactoryCreator::Create(
-    const OrtCUDAProviderOptionsV2* provider_options) try {
-  return s_library_cuda.Get().CreateExecutionProviderFactory(provider_options);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    const OrtCUDAProviderOptionsV2* provider_options) {
+  ORT_TRY {
+    return s_library_cuda.Get().CreateExecutionProviderFactory(provider_options);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 std::shared_ptr<IExecutionProviderFactory>
@@ -2094,55 +2272,50 @@ OrtTensorRTProviderOptionsV2 OrtTensorRTProviderOptionsToOrtTensorRTProviderOpti
   return trt_options_converted;
 }
 
-std::shared_ptr<IExecutionProviderFactory> TensorrtProviderFactoryCreator::Create(int device_id) try {
-  return s_library_tensorrt.Get().CreateExecutionProviderFactory(device_id);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+std::shared_ptr<IExecutionProviderFactory> TensorrtProviderFactoryCreator::Create(int device_id) {
+  ORT_TRY {
+    return s_library_tensorrt.Get().CreateExecutionProviderFactory(device_id);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 std::shared_ptr<IExecutionProviderFactory> TensorrtProviderFactoryCreator::Create(
-    const OrtTensorRTProviderOptions* provider_options) try {
-  OrtTensorRTProviderOptionsV2 trt_options_converted = onnxruntime::OrtTensorRTProviderOptionsToOrtTensorRTProviderOptionsV2(provider_options);
-  return s_library_tensorrt.Get().CreateExecutionProviderFactory(&trt_options_converted);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    const OrtTensorRTProviderOptions* provider_options) {
+  ORT_TRY {
+    OrtTensorRTProviderOptionsV2 trt_options_converted = onnxruntime::OrtTensorRTProviderOptionsToOrtTensorRTProviderOptionsV2(provider_options);
+    return s_library_tensorrt.Get().CreateExecutionProviderFactory(&trt_options_converted);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 std::shared_ptr<IExecutionProviderFactory> TensorrtProviderFactoryCreator::Create(
-    const OrtTensorRTProviderOptionsV2* provider_options) try {
-  return s_library_tensorrt.Get().CreateExecutionProviderFactory(provider_options);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    const OrtTensorRTProviderOptionsV2* provider_options) {
+  ORT_TRY {
+    return s_library_tensorrt.Get().CreateExecutionProviderFactory(provider_options);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
-std::shared_ptr<IExecutionProviderFactory> NvProviderFactoryCreator::Create(int device_id) try {
-  return s_library_nv.Get().CreateExecutionProviderFactory(device_id);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+std::shared_ptr<IExecutionProviderFactory> NvProviderFactoryCreator::Create(int device_id) {
+  ORT_TRY {
+    return s_library_nv.Get().CreateExecutionProviderFactory(device_id);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 std::shared_ptr<IExecutionProviderFactory> NvProviderFactoryCreator::Create(
-    const ProviderOptions& provider_options, const SessionOptions* session_options) try {
-  const ConfigOptions* config_options = nullptr;
-  if (session_options != nullptr) {
-    config_options = &session_options->config_options;
-  }
+    const ProviderOptions& provider_options, const SessionOptions* session_options) {
+  ORT_TRY {
+    const ConfigOptions* config_options = nullptr;
+    if (session_options != nullptr) {
+      config_options = &session_options->config_options;
+    }
 
-  std::array<const void*, 2> configs_array = {&provider_options, config_options};
-  const void* arg = reinterpret_cast<const void*>(&configs_array);
-  return s_library_nv.Get().CreateExecutionProviderFactory(arg);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    std::array<const void*, 2> configs_array = {&provider_options, config_options};
+    const void* arg = reinterpret_cast<const void*>(&configs_array);
+    return s_library_nv.Get().CreateExecutionProviderFactory(arg);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 std::shared_ptr<IExecutionProviderFactory> MIGraphXProviderFactoryCreator::Create(const ProviderOptions& provider_options) {
@@ -2194,37 +2367,35 @@ ProviderOptions OrtOpenVINOProviderOptionsToOrtOpenVINOProviderOptionsV2(const O
 
 #if !BUILD_QNN_EP_STATIC_LIB
 std::shared_ptr<IExecutionProviderFactory> QNNProviderFactoryCreator::Create(
-    const ProviderOptions& provider_options_map, const SessionOptions* session_options) try {
-  const ConfigOptions* config_options = nullptr;
-  if (session_options != nullptr) {
-    config_options = &session_options->config_options;
-  }
+    const ProviderOptions& provider_options_map, const SessionOptions* session_options) {
+  ORT_TRY {
+    const ConfigOptions* config_options = nullptr;
+    if (session_options != nullptr) {
+      config_options = &session_options->config_options;
+    }
 
-  std::array<const void*, 2> configs_array = {&provider_options_map, config_options};
-  const void* arg = reinterpret_cast<const void*>(&configs_array);
-  return s_library_qnn.Get().CreateExecutionProviderFactory(arg);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    std::array<const void*, 2> configs_array = {&provider_options_map, config_options};
+    const void* arg = reinterpret_cast<const void*>(&configs_array);
+    return s_library_qnn.Get().CreateExecutionProviderFactory(arg);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 #endif  // !BUILD_QNN_EP_STATIC_LIB
 
 std::shared_ptr<IExecutionProviderFactory> OpenVINOProviderFactoryCreator::Create(
-    const ProviderOptions* provider_options_map, const SessionOptions* session_options) try {
-  // Append session options applicable for EP to EP Provider options.
-  const ConfigOptions* config_options = nullptr;
-  if (session_options != nullptr) {
-    config_options = &session_options->config_options;
-  }
+    const ProviderOptions* provider_options_map, const SessionOptions* session_options) {
+  ORT_TRY {
+    // Append session options applicable for EP to EP Provider options.
+    const ConfigOptions* config_options = nullptr;
+    if (session_options != nullptr) {
+      config_options = &session_options->config_options;
+    }
 
-  std::array<const void*, 2> configs_array = {provider_options_map, config_options};
-  const void* arg = reinterpret_cast<const void*>(&configs_array);
-  return s_library_openvino.Get().CreateExecutionProviderFactory(arg);
-} catch (const std::exception& exception) {
-  // Will get an exception when fail to load EP library.
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    std::array<const void*, 2> configs_array = {provider_options_map, config_options};
+    const void* arg = reinterpret_cast<const void*>(&configs_array);
+    return s_library_openvino.Get().CreateExecutionProviderFactory(arg);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 std::shared_ptr<IExecutionProviderFactory> DnnlProviderFactoryCreator::Create(const OrtDnnlProviderOptions* dnnl_options) {
@@ -2232,25 +2403,31 @@ std::shared_ptr<IExecutionProviderFactory> DnnlProviderFactoryCreator::Create(co
 }
 
 std::shared_ptr<IExecutionProviderFactory> VitisAIProviderFactoryCreator::Create(
-    const ProviderOptions& provider_options) try {
-  return s_library_vitisai.Get().CreateExecutionProviderFactory(&provider_options);
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+    const ProviderOptions& provider_options) {
+  ORT_TRY {
+    return s_library_vitisai.Get().CreateExecutionProviderFactory(&provider_options);
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
-ProviderInfo_OpenVINO* TryGetProviderInfo_OpenVINO() try {
-  return reinterpret_cast<ProviderInfo_OpenVINO*>(s_library_openvino.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_OpenVINO* TryGetProviderInfo_OpenVINO() {
+  ORT_TRY {
+    auto status = s_library_openvino.Load();
+    if (!status.IsOK()) {
+      LogRuntimeError(0, status, __FILE__, static_cast<const char*>(__FUNCTION__), __LINE__);
+      LOGS_DEFAULT(ERROR) << status.ErrorMessage();
+      return nullptr;
+    }
+    return reinterpret_cast<ProviderInfo_OpenVINO*>(s_library_openvino.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
-ProviderInfo_TensorRT* TryGetProviderInfo_TensorRT() try {
-  return reinterpret_cast<ProviderInfo_TensorRT*>(s_library_tensorrt.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_TensorRT* TryGetProviderInfo_TensorRT() {
+  ORT_TRY {
+    return reinterpret_cast<ProviderInfo_TensorRT*>(s_library_tensorrt.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 ProviderInfo_TensorRT& GetProviderInfo_TensorRT() {
@@ -2260,11 +2437,11 @@ ProviderInfo_TensorRT& GetProviderInfo_TensorRT() {
   ORT_THROW("TensorRT Provider not available, can't get interface for it");
 }
 
-ProviderInfo_Nv* TryGetProviderInfo_Nv() try {
-  return reinterpret_cast<ProviderInfo_Nv*>(s_library_nv.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_Nv* TryGetProviderInfo_Nv() {
+  ORT_TRY {
+    return reinterpret_cast<ProviderInfo_Nv*>(s_library_nv.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 ProviderInfo_Nv& GetProviderInfo_Nv() {
@@ -2274,11 +2451,11 @@ ProviderInfo_Nv& GetProviderInfo_Nv() {
   ORT_THROW("NV Provider not available, can't get interface for it");
 }
 
-ProviderInfo_CUDA* TryGetProviderInfo_CUDA() try {
-  return reinterpret_cast<ProviderInfo_CUDA*>(s_library_cuda.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_CUDA* TryGetProviderInfo_CUDA() {
+  ORT_TRY {
+    return reinterpret_cast<ProviderInfo_CUDA*>(s_library_cuda.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 ProviderInfo_CUDA& GetProviderInfo_CUDA() {
@@ -2288,11 +2465,11 @@ ProviderInfo_CUDA& GetProviderInfo_CUDA() {
   ORT_THROW("CUDA Provider not available, can't get interface for it");
 }
 
-ProviderInfo_CUDA* TryGetProviderInfo_CUDA_Test() try {
-  return reinterpret_cast<ProviderInfo_CUDA*>(s_library_cuda_test.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_CUDA* TryGetProviderInfo_CUDA_Test() {
+  ORT_TRY {
+    return reinterpret_cast<ProviderInfo_CUDA*>(s_library_cuda_test.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 ProviderInfo_CUDA& GetProviderInfo_CUDA_Test() {
@@ -2302,11 +2479,11 @@ ProviderInfo_CUDA& GetProviderInfo_CUDA_Test() {
   ORT_THROW("CUDA Provider not available, can't get interface for it");
 }
 
-ProviderInfo_CANN* TryGetProviderInfo_CANN() try {
-  return reinterpret_cast<ProviderInfo_CANN*>(s_library_cann.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_CANN* TryGetProviderInfo_CANN() {
+  ORT_TRY {
+    return reinterpret_cast<ProviderInfo_CANN*>(s_library_cann.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 ProviderInfo_CANN& GetProviderInfo_CANN() {
@@ -2316,11 +2493,11 @@ ProviderInfo_CANN& GetProviderInfo_CANN() {
   ORT_THROW("CANN Provider not available, can't get interface for it");
 }
 
-ProviderInfo_Dnnl* TryGetProviderInfo_Dnnl() try {
-  return reinterpret_cast<ProviderInfo_Dnnl*>(s_library_dnnl.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_Dnnl* TryGetProviderInfo_Dnnl() {
+  ORT_TRY {
+    return reinterpret_cast<ProviderInfo_Dnnl*>(s_library_dnnl.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 ProviderInfo_Dnnl& GetProviderInfo_Dnnl() {
@@ -2330,11 +2507,11 @@ ProviderInfo_Dnnl& GetProviderInfo_Dnnl() {
   ORT_THROW("oneDNN Provider not available, can't get interface for it");
 }
 
-ProviderInfo_MIGraphX* TryGetProviderInfo_MIGraphX() try {
-  return reinterpret_cast<ProviderInfo_MIGraphX*>(s_library_migraphx.Get().GetInfo());
-} catch (const std::exception& exception) {
-  LOGS_DEFAULT(ERROR) << exception.what();
-  return nullptr;
+ProviderInfo_MIGraphX* TryGetProviderInfo_MIGraphX() {
+  ORT_TRY {
+    return reinterpret_cast<ProviderInfo_MIGraphX*>(s_library_migraphx.Get().GetInfo());
+  }
+  ORT_CATCH_LOG_RETURN_NULLPTR;
 }
 
 ProviderInfo_MIGraphX& GetProviderInfo_MIGraphX() {
@@ -2504,9 +2681,9 @@ ORT_API_STATUS_IMPL(OrtApis::SessionOptionsAppendExecutionProvider_OpenVINO_V2,
     // arbitrary length to validate the key/value. adjust if/when needed.
     // TODO: are any other input validation checks required here (and in the other functions that process
     // provider options)?
-    if (strlen(provider_options_keys[i]) > 1024 || strlen(provider_options_values[i]) > 1024) {
+    if (strlen(provider_options_keys[i]) > 1024 || strlen(provider_options_values[i]) > 2048) {
       return OrtApis::CreateStatus(ORT_INVALID_ARGUMENT,
-                                   "Maximum string length for a provider options key/value is 1024.");
+                                   "Maximum string length for a provider options key is 1024 and value is 2048.");
     }
 
     provider_options[provider_options_keys[i]] = provider_options_values[i];
@@ -2791,6 +2968,16 @@ ORT_API(void, OrtApis::ReleaseTensorRTProviderOptions, _Frees_ptr_opt_ OrtTensor
 
 ORT_API_STATUS_IMPL(OrtApis::SessionOptionsAppendExecutionProvider_CUDA_V2, _In_ OrtSessionOptions* options, _In_ const OrtCUDAProviderOptionsV2* cuda_options) {
   API_IMPL_BEGIN
+  if (cuda_options->external_data_loader_reading_threads >
+      OrtCUDAProviderOptionsV2::kMaxExternalDataLoaderReadingThreadCount) {
+    const auto message = onnxruntime::MakeString(
+        "external_data_loader_reading_threads must be between 0 and ",
+        OrtCUDAProviderOptionsV2::kMaxExternalDataLoaderReadingThreadCount, ".");
+    return OrtApis::CreateStatus(
+        ORT_INVALID_ARGUMENT,
+        message.c_str());
+  }
+
   auto factory = onnxruntime::CudaProviderFactoryCreator::Create(cuda_options);
   if (!factory) {
     return OrtApis::CreateStatus(ORT_FAIL, "OrtSessionOptionsAppendExecutionProvider_Cuda: Failed to load shared library");

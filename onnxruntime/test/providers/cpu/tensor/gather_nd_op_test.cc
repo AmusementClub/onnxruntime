@@ -5,6 +5,11 @@
 #include "test/providers/provider_test_utils.h"
 #include "test/common/cuda_op_test_utils.h"
 #include "test/common/tensor_op_test_utils.h"
+#include "test/util/include/default_providers.h"
+
+#ifdef USE_CUDA
+#include "core/providers/cuda/cuda_provider_options.h"
+#endif
 
 namespace onnxruntime {
 namespace test {
@@ -327,6 +332,174 @@ TEST(GatherNDOpTest, GatherND_slice_int64_t) {
   test.AddInput<int64_t>("indices", {2, 1}, {1LL, 0LL});
   test.AddOutput<int64_t>("output", {2, 2}, outputs);
   test.Run();
+}
+
+// Test for issue #23828: GatherND should return error instead of crashing
+// when batch dimensions mismatch between input and indices
+TEST(GatherNDOpTest, GatherND_batch_dims_mismatch_error) {
+  OpTester test("GatherND", 12, kOnnxDomain);
+  test.AddAttribute<int64_t>("batch_dims", 1);
+
+  // Input has 3 batches, but indices has 2 slices (indices batch size 2), which is not divisible by 3 - mismatch!
+  test.AddInput<float>("data", {3, 3}, {0.f, 1.f, 2.f, 10.f, 11.f, 12.f, 20.f, 21.f, 22.f});
+  test.AddInput<int64_t>("indices", {2, 1}, {1, 2});
+  test.AddOutput<float>("output", {2}, {0.f, 0.f});  // dummy output, won't be used
+
+  // Force execution only on CPU
+  std::vector<std::unique_ptr<onnxruntime::IExecutionProvider>> cpu_only_ep;
+  cpu_only_ep.push_back(DefaultCpuExecutionProvider());
+
+  test.Run(OpTester::ExpectResult::kExpectFailure,
+           "GatherND: indices batch size (2) is not divisible by input batch size (3)",
+           {},             // no excluded providers needed
+           nullptr,        // no RunOptions
+           &cpu_only_ep);  // force CPU
+}
+
+// Test for issue #23828: GatherND should return error when input batch dimension is zero
+TEST(GatherNDOpTest, GatherND_zero_batch_dims_error) {
+  OpTester test("GatherND", 12, kOnnxDomain);
+  test.AddAttribute<int64_t>("batch_dims", 1);
+
+  // Input has 0 batches - should fail with clear error instead of division by zero
+  test.AddInput<float>("data", {0, 3}, {});
+  test.AddInput<int64_t>("indices", {2, 1}, {1, 2});
+  test.AddOutput<float>("output", {2}, {0.f, 0.f});  // dummy output, won't be used
+
+  // Force execution only on CPU
+  std::vector<std::unique_ptr<onnxruntime::IExecutionProvider>> cpu_only_ep;
+  cpu_only_ep.push_back(DefaultCpuExecutionProvider());
+
+  test.Run(OpTester::ExpectResult::kExpectFailure,
+           "GatherND: input tensor batch dimensions cannot be zero",
+           {},
+           nullptr,
+           &cpu_only_ep);  // force CPU
+}
+
+// Test that GatherND returns an error when a non-batch dimension is zero and index is 0.
+// This is a regression test: the original code used `int64_t err_index = 0` as a sentinel,
+// so an out-of-bounds index of 0 was incorrectly treated as "no error".
+TEST(GatherNDOpTest, GatherND_zero_dim_error) {
+  OpTester test("GatherND", 12, kOnnxDomain);
+
+  // Input shape {2, 0, 3}: the second dimension has size 0, so any index into it is invalid.
+  // Indices shape {1, 2}: last dim is 2, so each index targets dimensions 0 and 1.
+  // Index {0, 0} targets dim 0 (size 2, valid) then dim 1 (size 0, invalid).
+  // Output shape would be {1, 3} (non-empty), so the early-exit doesn't trigger.
+  test.AddInput<float>("data", {2, 0, 3}, {});
+  test.AddInput<int64_t>("indices", {1, 2}, {0LL, 0LL});
+  test.AddOutput<float>("output", {1, 3}, {0.f, 0.f, 0.f});  // dummy output, won't be used
+
+  std::vector<std::unique_ptr<onnxruntime::IExecutionProvider>> cpu_only_ep;
+  cpu_only_ep.push_back(DefaultCpuExecutionProvider());
+
+  test.Run(OpTester::ExpectResult::kExpectFailure,
+           "invalid index found, index = 0",
+           {},
+           nullptr,
+           &cpu_only_ep);
+}
+
+#ifdef USE_CUDA
+TEST(GatherNDOpTest, GatherND_invalid_index_cuda_zero_filled) {
+  if (!HasCudaEnvironment(0)) {
+    GTEST_SKIP() << "CUDA not available";
+  }
+
+  OpTester test("GatherND", 12, kOnnxDomain);
+  test.AddInput<float>("data", {4, 4, 4}, ValueRange(64, 1.0f));
+  test.AddInput<int64_t>("indices", {1, 2}, {1048576LL, 0LL});
+  test.AddOutput<float>("output", {1, 4}, std::vector<float>(4, 0.0f));
+
+  std::vector<std::unique_ptr<IExecutionProvider>> cuda_only_ep;
+  cuda_only_ep.push_back(DefaultCudaExecutionProvider());
+
+  test.Run(OpTester::ExpectResult::kExpectSuccess,
+           "",
+           {},
+           nullptr,
+           &cuda_only_ep);
+}
+
+TEST(GatherNDOpTest, GatherND_zero_dim_negative_index_cuda_zero_filled) {
+  if (!HasCudaEnvironment(0)) {
+    GTEST_SKIP() << "CUDA not available";
+  }
+
+  OpTester test("GatherND", 12, kOnnxDomain);
+  test.AddInput<float>("data", {2, 0, 3}, {});
+  test.AddInput<int64_t>("indices", {1, 2}, {0LL, -1LL});
+  test.AddOutput<float>("output", {1, 3}, {0.f, 0.f, 0.f});
+
+  std::vector<std::unique_ptr<onnxruntime::IExecutionProvider>> cuda_only_ep;
+  cuda_only_ep.push_back(DefaultCudaExecutionProvider());
+
+  test.Run(OpTester::ExpectResult::kExpectSuccess,
+           "",
+           {},
+           nullptr,
+           &cuda_only_ep);
+}
+
+TEST(GatherNDOpTest, GatherNDCudaGraphCaptureSupportsBoundsCheck) {
+#if defined(ORT_UNIT_TEST_HAS_CUDA_PLUGIN_EP) && defined(ORT_UNIT_TEST_ENABLE_DYNAMIC_PLUGIN_EP_USAGE)
+  GTEST_SKIP() << "This test validates the built-in CUDA EP, not the dynamic plugin adapter.";
+#endif
+
+  if (!HasCudaEnvironment(0)) {
+    GTEST_SKIP() << "CUDA not available";
+  }
+
+  OrtCUDAProviderOptionsV2 cuda_options{};
+  cuda_options.enable_cuda_graph = 1;
+  auto cuda_ep = CudaExecutionProviderWithOptions(&cuda_options);
+  ASSERT_NE(cuda_ep, nullptr);
+  if (!cuda_ep->IsGraphCaptureEnabled()) {
+    GTEST_SKIP() << "Selected CUDA EP does not support graph capture.";
+  }
+
+  OpTester test("GatherND", 12, kOnnxDomain);
+  test.AddInput<float>("data", {2, 2}, {1.0f, 2.0f, 3.0f, 4.0f});
+  test.AddInput<int64_t>("indices", {1, 1}, {2});
+  test.AddOutput<float>("output", {1, 2}, {0.0f, 0.0f});
+
+  test.ConfigEp(std::move(cuda_ep));
+  test.RunWithConfig();
+}
+
+#endif
+
+#ifndef DISABLE_CONTRIB_OPS
+TEST(GatherNDOpTest, GatherND_contrib_int32_invalid_index_error) {
+  // Test contrib-domain GatherND with invalid indices on CPU (contrib op has no CUDA kernel)
+  OpTester test("GatherND", 1, kMSDomain);
+  test.AddInput<float>("data", {4, 4, 4}, std::vector<float>(64, 0.0f));
+  test.AddInput<int32_t>("indices", {1, 2}, {1048576, 0});
+  test.AddOutput<float>("output", {1, 4}, std::vector<float>(4, 0.0f));
+
+  std::vector<std::unique_ptr<IExecutionProvider>> cpu_only_ep;
+  cpu_only_ep.push_back(DefaultCpuExecutionProvider());
+
+  test.Run(OpTester::ExpectResult::kExpectFailure,
+           "invalid index found, index = 1048576",
+           {},
+           nullptr,
+           &cpu_only_ep);
+}
+#endif
+TEST(GatherNDOpTest, GatherND_runtime_scalar_indices_error) {
+  OpTester test("GatherND", 12, kOnnxDomain);
+  test.AddShapeToTensorData(false);
+  test.AddInput<float>("data", {2}, {1.f, 2.f});
+  test.AddInput<int64_t>("indices", {}, {0LL});
+  test.AddOutput<float>("output", {}, {0.f});
+
+  std::vector<std::unique_ptr<onnxruntime::IExecutionProvider>> cpu_only_ep;
+  cpu_only_ep.push_back(DefaultCpuExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectFailure,
+           "indices tensor must has rank larger than 0",
+           {}, nullptr, &cpu_only_ep);
 }
 
 }  // namespace test

@@ -26,6 +26,8 @@ limitations under the License.
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <limits>
+
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
@@ -55,6 +57,56 @@ namespace contrib {
 namespace cuda {
 
 constexpr size_t kMemoryAlignment = 256;
+// Canonicalize untrusted mask metadata on device instead of rejecting it on the host so the
+// attention path remains asynchronous and CUDA Graph capture-safe.
+__global__ void SanitizeMask1DKeySeqLenStartValues(const int32_t* input,
+                                                   int32_t* output,
+                                                   int32_t batch_size,
+                                                   int32_t sequence_length,
+                                                   int32_t total_sequence_length) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+
+  const int32_t* input_seqlen_k = input;
+  const int32_t* input_seqstart_q = input_seqlen_k + batch_size;
+  const int32_t* input_seqstart_k = input_seqstart_q + batch_size + 1;
+  int32_t* output_seqlen_k = output;
+  int32_t* output_seqstart_q = output_seqlen_k + batch_size;
+  int32_t* output_seqstart_k = output_seqstart_q + batch_size + 1;
+
+  const int64_t max_query_offset = static_cast<int64_t>(batch_size) * sequence_length;
+  const int64_t max_key_offset = static_cast<int64_t>(batch_size) * total_sequence_length;
+
+  int64_t previous_q = 0;
+  int64_t previous_k = 0;
+  for (int32_t i = 0; i <= batch_size; ++i) {
+    int64_t q = static_cast<int64_t>(input_seqstart_q[i]);
+    q = q < previous_q ? previous_q : q;
+    q = q > max_query_offset ? max_query_offset : q;
+    int64_t k = static_cast<int64_t>(input_seqstart_k[i]);
+    k = k < previous_k ? previous_k : k;
+    k = k > max_key_offset ? max_key_offset : k;
+    output_seqstart_q[i] = static_cast<int32_t>(q);
+    output_seqstart_k[i] = static_cast<int32_t>(k);
+    previous_q = q;
+    previous_k = k;
+  }
+
+  output_seqstart_q[0] = 0;
+  output_seqstart_q[batch_size] = static_cast<int32_t>(max_query_offset);
+  output_seqstart_k[0] = 0;
+  output_seqstart_k[batch_size] = static_cast<int32_t>(max_key_offset);
+
+  for (int32_t i = 0; i < batch_size; ++i) {
+    const int64_t max_seqlen =
+        static_cast<int64_t>(output_seqstart_k[i + 1]) - output_seqstart_k[i];
+    int64_t seqlen = static_cast<int64_t>(input_seqlen_k[i]);
+    seqlen = seqlen < 0 ? 0 : seqlen;
+    seqlen = seqlen > max_seqlen ? max_seqlen : seqlen;
+    output_seqlen_k[i] = static_cast<int32_t>(seqlen);
+  }
+}
 
 static size_t AlignTo(size_t a, size_t b) {
   return CeilDiv(a, b) * b;
@@ -254,7 +306,6 @@ Status FusedTrtSelfAttention(
 
   const int batch_size = parameters.batch_size;
   const int sequence_length = parameters.sequence_length;
-  const bool causal = parameters.is_unidirectional;
 
   const int32_t* sequence_offset = data.cumulated_sequence_length_q_cache;
   if (parameters.mask_type == AttentionMaskType::MASK_2D_KEY_PADDING) {
@@ -274,18 +325,13 @@ Status FusedTrtSelfAttention(
 
   FusedMHARunnerFP16v2* fused_fp16_runner = reinterpret_cast<FusedMHARunnerFP16v2*>(data.fused_runner);
 
-  const int s = causal ? sequence_length : fused_fp16_runner->NormalizeSequenceLength(sequence_length);
+  const int s = fused_fp16_runner->NormalizeSequenceLength(sequence_length);
 
   // B = 2 * batch_size when there is padding in input, and B = batch_size when padding is removed.
   const int b = (nullptr == data.mask_index ? batch_size : 2 * batch_size);
 
-  if (!causal) {
-    assert(data.qkv_format == AttentionQkvFormat::QKV_BSN3H);
-    fused_fp16_runner->Run(b, s, data.q, sequence_offset, data.output, stream);
-  } else {
-    assert(data.qkv_format == AttentionQkvFormat::Q_K_V_BNSH_QKV_BS3NH);
-    fused_fp16_runner->Run(b, s, data.gemm_buffer, sequence_offset, data.output, stream);
-  }
+  assert(data.qkv_format == AttentionQkvFormat::QKV_BSN3H);
+  fused_fp16_runner->Run(b, s, data.q, sequence_offset, data.output, stream);
 
   return Status::OK();
 }
@@ -426,7 +472,7 @@ Status CudnnFlashAttention(
          data.qkv_format == AttentionQkvFormat::Q_K_V_BNSH);
   assert(parameters.mask_type == AttentionMaskType::MASK_NONE ||
          parameters.mask_type == AttentionMaskType::MASK_1D_KEY_SEQ_LEN);
-  constexpr bool is_bf16 = false;
+  constexpr bool is_bf16 = std::is_same<T, BFloat16>::value;
 
   T* attention_bias = const_cast<T*>(data.attention_bias);
   int* mask_sequence_lengths_kv = const_cast<int*>(data.mask_index);
@@ -480,6 +526,7 @@ Status CudnnFlashAttention(
 template <typename T>
 Status EfficientAttention(
     const cudaDeviceProp& device_prop,
+    Stream* ort_stream,
     cudaStream_t stream,
     contrib::AttentionParameters& parameters,
     AttentionData<T>& data,
@@ -493,7 +540,8 @@ Status EfficientAttention(
 
   MemoryEfficientAttentionParams p;
   p.sm = device_prop.major * 10 + device_prop.minor;
-  p.is_half = sizeof(T) == 2;
+  p.is_bf16 = std::is_same<T, BFloat16>::value;
+  p.is_half = !p.is_bf16 && (sizeof(T) == 2);
   p.batch_size = parameters.batch_size;
   p.num_heads = parameters.num_heads;
   p.sequence_length = parameters.sequence_length;
@@ -505,12 +553,31 @@ Status EfficientAttention(
   p.scale = scale;
   p.use_smooth_softmax = false;
 
+  IAllocatorUniquePtr<int32_t> sanitized_mask;
+  if (data.mask_index != nullptr) {
+    const int64_t query_elements = static_cast<int64_t>(parameters.batch_size) * parameters.sequence_length;
+    const int64_t key_elements = static_cast<int64_t>(parameters.batch_size) * parameters.total_sequence_length;
+    ORT_RETURN_IF(query_elements > std::numeric_limits<int32_t>::max() ||
+                      key_elements > std::numeric_limits<int32_t>::max(),
+                  "FMHA sequence start offsets exceed INT32_MAX");
+
+    const size_t mask_elements = static_cast<size_t>(3) * static_cast<size_t>(parameters.batch_size) + 2;
+    sanitized_mask = IAllocator::MakeUniquePtr<int32_t>(data.allocator, mask_elements, false, ort_stream);
+    SanitizeMask1DKeySeqLenStartValues<<<1, 1, 0, stream>>>(
+        reinterpret_cast<const int32_t*>(data.mask_index),
+        sanitized_mask.get(),
+        parameters.batch_size,
+        parameters.sequence_length,
+        parameters.total_sequence_length);
+    CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  }
+
   if (nullptr == data.mask_index) {
     p.seqlen_k_ptr = nullptr;
     p.seqstart_q_ptr = nullptr;
     p.seqstart_k_ptr = nullptr;
   } else {
-    p.seqlen_k_ptr = reinterpret_cast<const int32_t*>(data.mask_index);
+    p.seqlen_k_ptr = sanitized_mask.get();
     p.seqstart_q_ptr = p.seqlen_k_ptr + parameters.batch_size;
     p.seqstart_k_ptr = p.seqlen_k_ptr + 2 * parameters.batch_size + 1;
   }
@@ -771,8 +838,9 @@ Status UnfusedAttention(
 
   DUMP_TENSOR_D("Softmax", scratch2, batch_size, num_heads, sequence_length, total_sequence_length);
 
-  // compute R*V (as V*R), and store in temp_output (space used by Q): BxNxSxH_v
-  T* temp_output = data.q;
+  // compute R*V (as V*R), and store in output or temp workspace depending on whether transpose is needed
+  // For 4D input (BNSH), write directly to output. For 3D input (BSNH), write to temp then transpose.
+  T* temp_output = parameters.is_output_bnsh ? data.output : data.q;
   CUBLAS_RETURN_IF_ERROR(cublasGemmStridedBatchedHelper(
       cublas, CUBLAS_OP_N, CUBLAS_OP_N,
       v_head_size, sequence_length, total_sequence_length,
@@ -780,14 +848,14 @@ Status UnfusedAttention(
       scratch2, total_sequence_length, sequence_length * total_sequence_length,
       &zero, temp_output, v_head_size, sequence_length * v_head_size, batches, device_prop, parameters.use_tf32));
 
-  // Temp_output is BxNxSxH_v, transpose to output BxSxNxH_v
-  Status result = LaunchTransCtx(stream, sequence_length, batch_size, v_head_size, num_heads,
-                                 device_prop.maxThreadsPerBlock, false, temp_output, data.output);
+  if (!parameters.is_output_bnsh) {
+    // Temp_output is BxNxSxH_v, transpose to output BxSxNxH_v
+    ORT_RETURN_IF_ERROR(LaunchTransCtx(stream, sequence_length, batch_size, v_head_size, num_heads,
+                                       device_prop.maxThreadsPerBlock, false, temp_output, data.output));
+  }
   DUMP_TENSOR_D("Attention Output", data.output, batch_size, sequence_length, num_heads, v_head_size);
-  return result;
+  return Status::OK();
 }
-
-#ifndef USE_ROCM  // exclude the following from hipify since they are not used in ROCM EP
 
 template <typename T>
 Status ConcatPastToPresent(int batch_size, int num_heads, int qk_head_size, int v_head_size,
@@ -800,8 +868,7 @@ Status ConcatPastToPresent(int batch_size, int num_heads, int qk_head_size, int 
   // When there is past state, the head size for Q/K/V shall be same: H == H_v.
 
   if (nullptr != data.present) {  // Attention op
-    assert(data.qkv_format == AttentionQkvFormat::Q_K_V_BNSH ||
-           data.qkv_format == AttentionQkvFormat::Q_K_V_BNSH_QKV_BS3NH);
+    assert(data.qkv_format == AttentionQkvFormat::Q_K_V_BNSH);
 
     ORT_RETURN_IF_ERROR(
         LaunchConcatTensorToTensor(
@@ -859,7 +926,6 @@ template Status ConcatPastToPresent<half>(int batch_size, int num_heads, int qk_
                                           cudaStream_t stream,
                                           int max_threads_per_block,
                                           AttentionData<half>& data);
-#endif
 
 template <typename T>
 Status PastPresentBufferShare(int batch_size, int num_heads, int qk_head_size, int v_head_size,
@@ -920,7 +986,7 @@ Status PastPresentBufferShare(int batch_size, int num_heads, int qk_head_size, i
     constexpr bool is_new_kv_bnsh_format = true;
     ORT_RETURN_IF_ERROR(LaunchConcatKVInPlace(
         batch_size, num_heads, qk_head_size, parameters.max_sequence_length,
-        data.seqlens_k_total, nullptr, parameters.sequence_length, data.k, data.v, data.present_key, data.present_value,
+        nullptr, data.seqlens_k_total, parameters.sequence_length, data.k, data.v, data.present_key, data.present_value,
         is_past_kv_bnsh_format, is_new_kv_bnsh_format, stream, max_threads_per_block));
 
     data.k = data.present_key;
@@ -952,10 +1018,17 @@ Status QkvToContext(
     Stream* ort_stream,
     contrib::AttentionParameters& parameters,
     AttentionData<T>& data) {
+  if constexpr (std::is_same<T, BFloat16>::value || std::is_same<QK, BFloat16>::value) {
+    if (device_prop.major < 8) {
+      ORT_THROW("BF16 Attention requires Ampere (sm_80)+ with BF16 support. This GPU (",
+                device_prop.name, ", cc ", device_prop.major, ".", device_prop.minor, ") is not supported.");
+    }
+  }
+
   auto stream = static_cast<cudaStream_t>(ort_stream->GetHandle());
   const int max_threads_per_block = device_prop.maxThreadsPerBlock;
   const int batch_size = parameters.batch_size;
-  const int sequence_length = parameters.sequence_length;
+  const int kv_sequence_length = parameters.kv_sequence_length;
   const int total_sequence_length = parameters.total_sequence_length;
   const int num_heads = parameters.num_heads;
   const int qk_head_size = parameters.head_size;
@@ -976,12 +1049,12 @@ Status QkvToContext(
 
   if (!parameters.past_present_share_buffer) {
     ORT_RETURN_IF_ERROR(ConcatPastToPresent<T>(batch_size, num_heads, qk_head_size, v_head_size,
-                                               sequence_length, total_sequence_length,
+                                               kv_sequence_length, total_sequence_length,
                                                stream, max_threads_per_block, data));
 
   } else {  // past_present_share_buffer
     ORT_RETURN_IF_ERROR(PastPresentBufferShare<T>(batch_size, num_heads, qk_head_size, v_head_size,
-                                                  sequence_length, fused_runner,
+                                                  kv_sequence_length, fused_runner,
                                                   parameters, data, stream, max_threads_per_block));
   }
 
@@ -1022,7 +1095,7 @@ Status QkvToContext(
 #if USE_MEMORY_EFFICIENT_ATTENTION
   if (data.use_memory_efficient_attention) {
     DUMP_STRING("EfficientAttention");
-    return EfficientAttention<T>(device_prop, stream, parameters, data, scale);
+    return EfficientAttention<T>(device_prop, ort_stream, stream, parameters, data, scale);
   }
 #endif
 
@@ -1040,6 +1113,8 @@ template struct AttentionData<float>;
 
 template struct AttentionData<half>;
 
+template struct AttentionData<BFloat16>;
+
 template Status QkvToContext<float>(
     const cudaDeviceProp& device_prop,
     cublasHandle_t& cublas,
@@ -1056,6 +1131,14 @@ template Status QkvToContext<half>(
     contrib::AttentionParameters& parameters,
     AttentionData<half>& data);
 
+template Status QkvToContext<BFloat16>(
+    const cudaDeviceProp& device_prop,
+    cublasHandle_t& cublas,
+    cudnnHandle_t& cudnn,
+    Stream* ort_stream,
+    contrib::AttentionParameters& parameters,
+    AttentionData<BFloat16>& data);
+
 template Status QkvToContext<float, half>(
     const cudaDeviceProp& device_prop,
     cublasHandle_t& cublas,
@@ -1071,6 +1154,16 @@ template Status QkvToContext<half, float>(
     Stream* ort_stream,
     contrib::AttentionParameters& parameters,
     AttentionData<half>& data);
+
+template onnxruntime::common::Status
+QkvToContext<float, BFloat16>(
+    const cudaDeviceProp&, cublasHandle_t&, cudnnHandle_t&,
+    Stream*, contrib::AttentionParameters&, AttentionData<float>&);
+
+template onnxruntime::common::Status
+QkvToContext<BFloat16, float>(
+    const cudaDeviceProp&, cublasHandle_t&, cudnnHandle_t&,
+    Stream*, contrib::AttentionParameters&, AttentionData<BFloat16>&);
 
 template Status LaunchDecoderMaskedMultiHeadAttention<float, float>(
     const DecoderMaskedMultiHeadAttentionParameters& parameters,

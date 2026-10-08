@@ -16,10 +16,7 @@
 #include "core/providers/cuda/shared_inc/cuda_utils.h"
 #include "core/providers/cuda/shared_inc/cuda_call.h"
 #include "core/providers/cuda/tunable/cuda_tuning_context.h"
-
-#ifndef DISABLE_CONTRIB_OPS
 #include "contrib_ops/cuda/bert/attention_kernel_options.h"
-#endif
 
 namespace onnxruntime {
 
@@ -66,13 +63,12 @@ class CUDAExecutionProvider : public IExecutionProvider {
     return stream_;
   }
 
-  template <typename T>
-  const T* GetConstOnes(size_t count, cudaStream_t stream) {
-    return GetPerThreadContext().template GetConstOnes<T>(count, stream);
-  }
-
   std::shared_ptr<KernelRegistry> GetKernelRegistry() const override;
   std::unique_ptr<onnxruntime::IDataTransfer> GetDataTransfer() const override;
+  // Replaces the framework fallback used when an EP has no external-data loader. That path
+  // materializes a pageable/mmap-backed CPU tensor before GPUDataTransfer copies it to CUDA.
+  // This loader instead reads into pinned buffers and copies directly to the CUDA BFC Arena.
+  std::unique_ptr<onnxruntime::IExternalDataLoader> GetExternalDataLoader() const override;
 
   std::vector<std::unique_ptr<ComputeCapability>> GetCapability(
       const onnxruntime::GraphViewer& graph,
@@ -86,25 +82,33 @@ class CUDAExecutionProvider : public IExecutionProvider {
   bool DoCopyOnDefaultStream() const { return info_.do_copy_in_default_stream; }
   bool GetCudnnConvUseMaxWorkspace() const { return info_.cudnn_conv_use_max_workspace; }
   bool GetCudnnConv1dPadToNc1d() const { return info_.cudnn_conv1d_pad_to_nc1d; }
-  bool IsSkipLayerNormInStrictMode() const { return info_.enable_skip_layer_norm_strict_mode; }
   bool IsNHWCPreferred() const { return info_.prefer_nhwc; }
   bool IsFuseConvBias() const { return info_.fuse_conv_bias; }
   bool UseTF32() const { return info_.use_tf32; }
 
-#ifndef DISABLE_CONTRIB_OPS
   // Attention kernel options parsed from sdpa_kernel cuda provider option.
   const AttentionKernelOptions* GetAttentionKernelOptions() const {
     attention_kernel_options_.InitializeOnce(info_.sdpa_kernel, true, true);
     return &attention_kernel_options_;
   }
-#endif
 
   ProviderOptions GetProviderOptions() const override {
     return CUDAExecutionProviderInfo::ToProviderOptions(info_);
   }
 
-  static AllocatorPtr CreateCudaAllocator(OrtDevice::DeviceId device_id, size_t cuda_mem_limit, ArenaExtendStrategy arena_extend_strategy,
-                                          CUDAExecutionProviderExternalAllocatorInfo external_alloc_info, const OrtArenaCfg* arena_cfg);
+  struct CUDAAllocatorParams {
+    OrtDevice::DeviceId device_id = 0;
+    size_t cuda_mem_threshold = std::numeric_limits<size_t>::max();
+    ArenaExtendStrategy arena_extend_strategy = ArenaExtendStrategy::kNextPowerOfTwo;
+    const CUDAExecutionProviderInfo* provider_info = nullptr;
+    const CUDAExecutionProviderExternalAllocatorInfo* external_alloc_info = nullptr;
+    const OrtArenaCfg* arena_cfg = nullptr;
+    const logging::Logger* logger = nullptr;
+  };
+
+  static AllocatorPtr CreateCudaAllocator(const CUDAAllocatorParams& cuda_allocator_params);
+
+  static AllocatorPtr CreateCudaPinnedAllocator(const CUDAAllocatorParams& cuda_allocator_params);
 
   ITuningContext* GetTuningContext() const override;
 
@@ -112,12 +116,24 @@ class CUDAExecutionProvider : public IExecutionProvider {
 
   bool IsGraphCaptureEnabled() const override;
   bool IsGraphCaptured(CudaGraphAnnotation_t graph_annotation_id) const override;
-  Status ReplayGraph(CudaGraphAnnotation_t graph_annotation_id) override;
+  Status ReplayGraph(CudaGraphAnnotation_t graph_annotation_id, bool sync = true) override;
+  OrtGraphCaptureNodeAssignmentPolicy GetGraphCaptureNodeAssignmentPolicy() const override {
+    return OrtGraphCaptureNodeAssignmentPolicy_ALLOW_CPU_FOR_SHAPES;
+  }
   void RegisterStreamHandlers(IStreamCommandHandleRegistry& stream_handle_registry, AllocatorMap& allocators) const override;
   OrtDevice GetOrtDeviceByMemType(OrtMemType mem_type) const override;
   std::vector<AllocatorPtr> CreatePreferredAllocators() override;
 
+  // Takes ownership of a host buffer that a kernel staged a device copy from while the
+  // stream was capturing.  The copy is a node of the captured graph and re-reads the
+  // buffer on every replay, so it must not go back to the allocator and be overwritten
+  // by a later run.  Held until the provider is destroyed.
+  void RetainBufferForGraphCapture(std::shared_ptr<void> buffer) const;
+
  private:
+  mutable std::mutex captured_host_buffers_mutex_;
+  mutable std::vector<std::shared_ptr<void>> captured_host_buffers_;
+
   CUDAExecutionProviderInfo info_;
   cudaDeviceProp device_prop_;
   bool external_stream_ = false;
@@ -129,15 +145,12 @@ class CUDAExecutionProvider : public IExecutionProvider {
   // the tuning context might be altered when calling into a TunableOp
   mutable cuda::tunable::CudaTuningContext tuning_context_;
 
-#ifndef DISABLE_CONTRIB_OPS
   // Attention kernel options parsed from sdpa_kernel cuda provider option.
   mutable AttentionKernelOptions attention_kernel_options_;
-#endif
 
   class PerThreadContext final {
    public:
-    PerThreadContext(OrtDevice::DeviceId device_id, cudaStream_t stream, size_t cuda_mem_limit, ArenaExtendStrategy arena_extend_strategy,
-                     CUDAExecutionProviderExternalAllocatorInfo external_alloc_info, OrtArenaCfg* arena_cfg);
+    PerThreadContext(OrtDevice::DeviceId device_id, cudaStream_t stream, const CUDAExecutionProviderInfo& info);
     ~PerThreadContext();
     ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(PerThreadContext);
 
@@ -153,67 +166,19 @@ class CUDAExecutionProvider : public IExecutionProvider {
       return cublas_lt_handle_;
     }
 
-    template <typename T>
-    const T* GetConstOnes(size_t count, cudaStream_t stream) {
-      if constexpr (std::is_same<T, float>::value) {
-        if (!constant_ones_float_) {
-          constant_ones_float_ = cuda::CreateConstantOnes<float>();
-        }
-        return reinterpret_cast<const T*>(constant_ones_float_->GetBuffer(stream, count));
-      } else if constexpr (std::is_same<T, double>::value) {
-        if (!constant_ones_double_) {
-          constant_ones_double_ = cuda::CreateConstantOnes<double>();
-        }
-        return reinterpret_cast<const T*>(constant_ones_double_->GetBuffer(stream, count));
-      } else if constexpr (std::is_same<T, half>::value) {
-        if (!constant_ones_half_) {
-          constant_ones_half_ = cuda::CreateConstantOnes<half>();
-        }
-        return reinterpret_cast<const T*>(constant_ones_half_->GetBuffer(stream, count));
-      } else if constexpr (std::is_same<T, BFloat16>::value) {
-        if (!constant_ones_bfloat16_) {
-          constant_ones_bfloat16_ = cuda::CreateConstantOnes<BFloat16>();
-        }
-        return reinterpret_cast<const T*>(constant_ones_bfloat16_->GetBuffer(stream, count));
-#if !defined(DISABLE_FLOAT8_TYPES)
-      } else if constexpr (std::is_same<T, Float8E4M3FN>::value) {
-        if (!constant_ones_float8e4m3fn_) {
-          constant_ones_float8e4m3fn_ = cuda::CreateConstantOnes<Float8E4M3FN>();
-        }
-        return reinterpret_cast<const T*>(constant_ones_float8e4m3fn_->GetBuffer(stream, count));
-      } else if constexpr (std::is_same<T, Float8E5M2>::value) {
-        if (!constant_ones_float8e5m2_) {
-          constant_ones_float8e5m2_ = cuda::CreateConstantOnes<Float8E5M2>();
-        }
-        return reinterpret_cast<const T*>(constant_ones_float8e5m2_->GetBuffer(stream, count));
-#endif
-      } else {
-        return nullptr;
-      }
-    }
-
     bool IsGraphCaptureAllowed(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
     bool IsGraphCaptureAllowedOnRun(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
     void CaptureBegin(CudaGraphAnnotation_t cuda_graph_annotation_id);
     void CaptureEnd(CudaGraphAnnotation_t cuda_graph_annotation_id);
     bool IsGraphCaptured(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
     CudaGraphAnnotation_t GetCudaGraphAnnotationId(const onnxruntime::RunOptions& run_options) const;
-    Status ReplayGraph(CudaGraphAnnotation_t cuda_graph_annotation_id);
+    Status ReplayGraph(CudaGraphAnnotation_t cuda_graph_annotation_id, bool sync = true);
     void IncrementRegularRunCountBeforeGraphCapture(CudaGraphAnnotation_t cuda_graph_annotation_id);
 
    private:
     cublasHandle_t cublas_handle_ = nullptr;
     cudnnHandle_t cudnn_handle_ = nullptr;
     cublasLtHandle_t cublas_lt_handle_ = nullptr;
-
-    std::unique_ptr<cuda::IConstantBuffer<float>> constant_ones_float_;
-    std::unique_ptr<cuda::IConstantBuffer<double>> constant_ones_double_;
-    std::unique_ptr<cuda::IConstantBuffer<half>> constant_ones_half_;
-    std::unique_ptr<cuda::IConstantBuffer<BFloat16>> constant_ones_bfloat16_;
-#if !defined(DISABLE_FLOAT8_TYPES)
-    std::unique_ptr<cuda::IConstantBuffer<Float8E4M3FN>> constant_ones_float8e4m3fn_;
-    std::unique_ptr<cuda::IConstantBuffer<Float8E5M2>> constant_ones_float8e5m2_;
-#endif
 
     // Cuda graph with multi threads will be supported in the future, so cuda_graph_
     // is put under PerThreadContext.

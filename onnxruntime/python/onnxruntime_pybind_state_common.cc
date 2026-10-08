@@ -27,21 +27,9 @@ bool do_copy_in_default_stream = true;
 // TODO remove deprecated global config
 onnxruntime::cuda::TunableOpInfo tunable_op{};
 onnxruntime::CUDAExecutionProviderExternalAllocatorInfo external_allocator_info{};
-// TODO remove deprecated global config
-onnxruntime::ArenaExtendStrategy arena_extend_strategy = onnxruntime::ArenaExtendStrategy::kNextPowerOfTwo;
 #endif
 
-#ifdef USE_ROCM
-// TODO remove deprecated global config
-bool miopen_conv_exhaustive_search = false;
-// TODO remove deprecated global config
-bool do_copy_in_default_stream = true;
-// TODO remove deprecated global config
-onnxruntime::rocm::TunableOpInfo tunable_op{};
-onnxruntime::ROCMExecutionProviderExternalAllocatorInfo external_allocator_info{};
-#endif
-
-#if defined(USE_ROCM) || defined(USE_MIGRAPHX)
+#if defined(USE_MIGRAPHX) || defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
 // TODO remove deprecated global config
 onnxruntime::ArenaExtendStrategy arena_extend_strategy = onnxruntime::ArenaExtendStrategy::kNextPowerOfTwo;
 #endif
@@ -79,6 +67,10 @@ PyObject* ToDlpack(OrtValue ort_value) {
 // Consume a Capsule object and claims the ownership of its underlying tensor to
 // create a OrtValue. This function calls DlpackToOrtValue(...) to do the conversion.
 OrtValue FromDlpack(PyObject* dlpack_tensor, const bool is_bool_tensor) {
+  if (!PyCapsule_IsValid(dlpack_tensor, "dltensor")) {
+    throw py::type_error("from_dlpack expected a valid DLPack capsule named 'dltensor'");
+  }
+
   // Extract DLPack tensor pointer from the capsule carrier.
   DLManagedTensor* dlmanaged_tensor = (DLManagedTensor*)PyCapsule_GetPointer(dlpack_tensor, "dltensor");
   OrtValue ort_value = dlpack::DlpackToOrtValue(dlmanaged_tensor, is_bool_tensor);

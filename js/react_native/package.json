@@ -28,6 +28,9 @@
     "react-native": "^0.73.11",
     "react-native-builder-bob": "^0.37.0"
   },
+  "overrides": {
+    "fast-xml-parser": "^5.7.0"
+  },
   "peerDependencies": {
     "react": "*",
     "react-native": "*"
@@ -37,10 +40,11 @@
     "registry": "https://registry.npmjs.org/"
   },
   "source": "lib/index",
-  "version": "1.23.0",
+  "version": "1.31.0",
   "main": "dist/commonjs/index",
   "homepage": "https://github.com/microsoft/onnxruntime/blob/main/js/react_native/README.md",
   "files": [
+    "cpp",
     "lib",
     "dist",
     "android",
@@ -48,6 +52,7 @@
     "ios/*.mm",
     "onnxruntime-react-native.podspec",
     "app.plugin.js",
+    "react-native.config.js",
     "unimodule.json",
     "!dist/commonjs/*.js.map",
     "!dist/module/*.js.map",
@@ -57,7 +62,8 @@
     "!android/gradlew",
     "!android/gradlew.bat",
     "!android/gradle/wrapper/*.jar",
-    "!android/libs"
+    "!android/libs",
+    "!cpp/test"
   ],
   "description": "ONNX Runtime bridge for react native",
   "repository": "https://github.com/Microsoft/onnxruntime.git",
@@ -77,15 +83,15 @@
     "output": "dist"
   },
   "dependencies": {
-    "buffer": "^6.0.3",
     "onnxruntime-common": "file:../common"
   },
   "scripts": {
     "typescript": "tsc --noEmit",
     "prepare": "bob build",
-    "bootstrap-no-pods": "npm run pack-common && npm run unpack-common && npm run pack-libs && npm run unpack-libs && npm run e2e",
+    "bootstrap-no-pods": "npm run test:cpp && npm run pack-common && npm run unpack-common && npm run pack-libs && npm run unpack-libs && npm run e2e && npm --prefix e2e run test:unit",
     "bootstrap": "npm run bootstrap-no-pods && npm run pods",
     "test": "jest",
+    "test:cpp": "cmake -S cpp/test -B ../../build/react-native-cpp-test && cmake --build ../../build/react-native-cpp-test --config Release && ctest --test-dir ../../build/react-native-cpp-test -C Release --output-on-failure",
     "pack-common": "cd ../common && npm pack && mv -f onnxruntime-common-*.tgz ../react_native/e2e/onnxruntime-common.tgz",
     "unpack-common": "npm --prefix e2e install ./e2e/onnxruntime-common.tgz",
     "pack-libs": "npm pack --ort-js-pack-mode=e2e && mv -f onnxruntime-react-native-*.tgz e2e/onnxruntime-react-native.tgz",

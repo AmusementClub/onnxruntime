@@ -45,9 +45,9 @@
 
 // The previous macros are used in header files to declare the availability of the APIs.
 // The following macros are used in  build time checks to determine if the APIs are available.
-#define CAN_BUILD_COREML8_OR_LATER (__MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000)
-#define CAN_BUILD_COREML7_OR_LATER (__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000 && __IPHONE_OS_VERSION_MAX_ALLOWED >= 170000)
-#define CAN_BUILD_COREML6_OR_LATER (__MAC_OS_X_VERSION_MAX_ALLOWED >= 130000 && __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000)
+#define CAN_BUILD_COREML8_OR_LATER (__MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 || __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000)
+#define CAN_BUILD_COREML7_OR_LATER (__MAC_OS_X_VERSION_MAX_ALLOWED >= 140000 || __IPHONE_OS_VERSION_MAX_ALLOWED >= 170000)
+#define CAN_BUILD_COREML6_OR_LATER (__MAC_OS_X_VERSION_MAX_ALLOWED >= 130000 || __IPHONE_OS_VERSION_MAX_ALLOWED >= 160000)
 
 // @available is used in implementation code to check the availability of the APIs at runtime.
 // Base required OS to run CoreML Specification Version 4 (Core ML 3)
@@ -61,6 +61,11 @@
 #endif
 
 #define MINIMUM_COREML_VERSION 5  // first version we support
+
+// Core ML 6 (iOS 16 / macOS 13) introduced MLComputeUnitsCPUAndNeuralEngine, the only compute-units mode that
+// enables the Neural Engine without also enabling the GPU. Earlier versions cannot honor a Neural-Engine-only
+// request, so device-based EP selection does not offer the Neural Engine below this version.
+#define MINIMUM_COREML_VERSION_FOR_NEURAL_ENGINE_SELECTION 6
 
 namespace onnxruntime {
 namespace coreml {

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #if !defined(ORT_MINIMAL_BUILD)
+#include "core/common/narrow.h"
 #include "core/graph/constants.h"
 #include "core/graph/onnx_protobuf.h"
 #include "core/graph/graph_utils.h"
@@ -57,6 +58,12 @@ bool IsInitializerWithExpectedValue(const Graph& graph, const NodeArg& input_arg
   }
 
   Initializer init_const{graph, *tensor_proto, graph.ModelPath()};
+  // The NodeArg shape is the inferred type, which is not guaranteed to agree with the dims declared
+  // on the initializer itself. Verify the element count before reading the first element.
+  if (init_const.size() < 1) {
+    return false;
+  }
+
   const auto data_type = tensor_proto->data_type();
   if (data_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
     const float* val = init_const.data<float>();
@@ -110,7 +117,19 @@ bool IsInitializerWithExpectedValue(const Graph& graph, const NodeArg& input_arg
     return false;
   }
 
+  // GetConstantInitializer() returns nullptr when the NodeArg is not backed by a constant
+  // initializer, which a model is free to do for any input this helper inspects.
+  if (tensor_proto == nullptr) {
+    return false;
+  }
+
   Initializer init_const{graph, *tensor_proto, graph.ModelPath()};
+  // The NodeArg shape is the inferred type, which is not guaranteed to agree with the dims declared
+  // on the initializer itself. Verify the element count before reading the first element.
+  if (init_const.size() < 1) {
+    return false;
+  }
+
   const auto data_type = tensor_proto->data_type();
   if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT64) {
     const int64_t* val = init_const.data<int64_t>();
@@ -175,11 +194,11 @@ bool AppendTensorFromInitializer(const Graph& graph, const NodeArg& input_arg, I
   const auto data_type = tensor_proto->data_type();
   if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT64) {
     const int64_t* val = init_const.data<int64_t>();
-    data.reserve(data.size() + gsl::narrow<size_t>(init_const.size()));
+    data.reserve(data.size() + narrow<size_t>(init_const.size()));
     data.insert(data.end(), val, val + init_const.size());
   } else if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT32) {
     const int32_t* val = init_const.data<int32_t>();
-    data.reserve(data.size() + gsl::narrow<size_t>(init_const.size()));
+    data.reserve(data.size() + narrow<size_t>(init_const.size()));
     for (size_t i = 0; i < init_const.size(); i++) {
       data.push_back(static_cast<int64_t>(val[i]));
     }
@@ -305,6 +324,11 @@ bool IsOperationDeterministic(const std::string& domain, const std::string& op) 
 
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
 
+bool IsScalarOr1Element1DTensor(gsl::span<const int64_t> tensor_shape) {
+  const size_t rank = tensor_shape.size();
+  return (rank == 0) || ((rank == 1) && (tensor_shape[0] == 1));
+}
+
 bool GetClipConstantMinMax(const Graph& graph, const Node& node, float& min, float& max) {
   min = std::numeric_limits<float>::lowest();
   max = std::numeric_limits<float>::max();
@@ -330,28 +354,119 @@ bool GetClipConstantMinMax(const Graph& graph, const Node& node, float& min, flo
             return true;
           }
 
-          bool is_constant = true;
+          bool is_constant = false;
           const ONNX_NAMESPACE::TensorProto* initializer = graph.GetConstantInitializer(input->Name(), true);
           if (initializer) {
             Initializer i(graph, *initializer, graph.ModelPath());
+            // Clip min/max are expected to be scalar/1-element tensors.
+            if (i.size() != 1) {
+              return false;
+            }
             switch (initializer->data_type()) {
               case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
                 value = *i.data<float>();
+                is_constant = true;
                 break;
-              // double isn't currently supported
-              // case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE:
-              //  value = static_cast<float>(*i.data<double>());
-              //  break;
               case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
                 value = math::halfToFloat(i.data<MLFloat16>()->val);
+                is_constant = true;
                 break;
               default:
-                ORT_THROW("Unexpected data type for Clip input of ", initializer->data_type());
+                is_constant = false;
+                break;
             }
-          } else {
-            is_constant = false;
+            return is_constant;
           }
-
+          const Node* producer = graph.GetProducerNode(input->Name());
+          if (producer && producer->OpType() == "DequantizeLinear") {
+            const auto& dq_inputs = producer->InputDefs();
+            const ONNX_NAMESPACE::TensorProto* dq_input = graph.GetConstantInitializer(dq_inputs[0]->Name(), true);
+            const ONNX_NAMESPACE::TensorProto* dq_scale = graph.GetConstantInitializer(dq_inputs[1]->Name(), true);
+            const ONNX_NAMESPACE::TensorProto* dq_zero_point = graph.GetConstantInitializer(dq_inputs[2]->Name(), true);
+            if (!dq_input || !dq_scale || !dq_zero_point) {
+              return false;
+            }
+            // Check scale and zero_point are scalar
+            Initializer scale_initializer(graph, *dq_scale, graph.ModelPath());
+            Initializer zero_point_initializer(graph, *dq_zero_point, graph.ModelPath());
+            if (!IsScalarOr1Element1DTensor(scale_initializer.dims()) || !IsScalarOr1Element1DTensor(zero_point_initializer.dims())) {
+              return false;
+            }
+            float scale = 1.0f;
+            float zero_point = 0.0f;
+            // Get scale
+            switch (dq_scale->data_type()) {
+              case ONNX_NAMESPACE::TensorProto_DataType_FLOAT: {
+                scale = *scale_initializer.data<float>();
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16: {
+                scale = math::halfToFloat(scale_initializer.data<MLFloat16>()->val);
+                break;
+              }
+              default:
+                return false;
+            }
+            // Get zero_point
+            switch (dq_zero_point->data_type()) {
+              case ONNX_NAMESPACE::TensorProto_DataType_UINT8: {
+                zero_point = static_cast<float>(*zero_point_initializer.data<uint8_t>());
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_INT8: {
+                zero_point = static_cast<float>(*zero_point_initializer.data<int8_t>());
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_UINT16: {
+                zero_point = static_cast<float>(*zero_point_initializer.data<uint16_t>());
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_INT16: {
+                zero_point = static_cast<float>(*zero_point_initializer.data<int16_t>());
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_INT32: {
+                zero_point = static_cast<float>(*zero_point_initializer.data<int32_t>());
+                break;
+              }
+              default:
+                return false;
+            }
+            // Restore original input value
+            Initializer x_initializer(graph, *dq_input, graph.ModelPath());
+            if (!IsScalarOr1Element1DTensor(x_initializer.dims())) {
+              return false;
+            }
+            switch (dq_input->data_type()) {
+              case ONNX_NAMESPACE::TensorProto_DataType_UINT8: {
+                value = scale * (static_cast<float>(*x_initializer.data<uint8_t>()) - zero_point);
+                is_constant = true;
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_INT8: {
+                value = scale * (static_cast<float>(*x_initializer.data<int8_t>()) - zero_point);
+                is_constant = true;
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_UINT16: {
+                value = scale * (static_cast<float>(*x_initializer.data<uint16_t>()) - zero_point);
+                is_constant = true;
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_INT16: {
+                value = scale * (static_cast<float>(*x_initializer.data<int16_t>()) - zero_point);
+                is_constant = true;
+                break;
+              }
+              case ONNX_NAMESPACE::TensorProto_DataType_INT32: {
+                value = scale * (static_cast<float>(*x_initializer.data<int32_t>()) - zero_point);
+                is_constant = true;
+                break;
+              }
+              default:
+                return false;
+            }
+          }
           return is_constant;
         };
 
@@ -403,6 +518,13 @@ bool IsScalar(const NodeArg& input_arg) {
   return dim_size == 0 || (dim_size == 1 && shape->dim(0).has_dim_value() && shape->dim(0).dim_value() == 1);
 }
 
+void DuplicateNodeAnnotation(const Node& src, Node& dst) {
+  const auto& src_annotation = src.GetLayeringAnnotation();
+  if (!src_annotation.empty()) {
+    dst.SetLayeringAnnotation(src_annotation);
+  }
+}
+
 template <typename T>
 bool GetScalarInitializerValue(const onnxruntime::Graph& graph, const onnxruntime::NodeArg& input_arg, T& value,
                                bool is_constant) {
@@ -422,6 +544,12 @@ bool GetScalarInitializerValue(const onnxruntime::Graph& graph, const onnxruntim
   }
 
   Initializer init_const{graph, *tensor_proto, graph.ModelPath()};
+  // The NodeArg shape is the inferred type, which is not guaranteed to agree with the dims declared
+  // on the initializer itself. Verify the element count before reading the first element.
+  if (init_const.size() < 1) {
+    return false;
+  }
+
   const T* val = init_const.data<T>();
   value = *val;
 

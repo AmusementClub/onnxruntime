@@ -13,6 +13,11 @@ constexpr size_t NormalizeBufferSize(size_t size) {
   return (size + 15) / 16 * 16;
 }
 
+// WebGPU requires that the copy size in CopyBufferToBuffer must be a multiple of 4 bytes.
+constexpr size_t NormalizeCopySize(size_t size) {
+  return (size + 3) / 4 * 4;
+}
+
 void EnforceBufferUnmapped(WebGpuContext& context, WGPUBuffer buffer) {
   if (context.ValidationMode() > ValidationMode::Basic) {
     ORT_ENFORCE(wgpuBufferGetMapState(buffer) == WGPUBufferMapState_Unmapped, "Buffer is still mapped.");
@@ -22,6 +27,8 @@ void EnforceBufferUnmapped(WebGpuContext& context, WGPUBuffer buffer) {
 }  // namespace
 
 class DisabledCacheManager : public IBufferCacheManager {
+  bool SupportsBufferReuse() const override { return false; }
+
   size_t CalculateBufferSize(size_t request_size) override {
     return NormalizeBufferSize(request_size);
   }
@@ -43,6 +50,8 @@ class DisabledCacheManager : public IBufferCacheManager {
 };
 
 class LazyReleaseCacheManager : public IBufferCacheManager {
+  bool SupportsBufferReuse() const override { return false; }
+
   size_t CalculateBufferSize(size_t request_size) override {
     return NormalizeBufferSize(request_size);
   }
@@ -221,6 +230,9 @@ class BucketCacheManager : public IBufferCacheManager {
         wgpuBufferRelease(buffer);
       }
     }
+    for (auto& buffer_info : pending_buffers_) {
+      wgpuBufferRelease(buffer_info.first);
+    }
   }
 
  protected:
@@ -282,35 +294,40 @@ class GraphCacheManager : public IBufferCacheManager {
   }
 
   void ReleaseBuffer(WGPUBuffer buffer) override {
-    pending_buffers_.emplace_back(buffer);
+    auto buffer_size = static_cast<size_t>(wgpuBufferGetSize(buffer));
+    auto it = buckets_.find(buffer_size);
+    if (it != buckets_.end()) {
+      it->second.emplace_back(buffer);
+    } else {
+      // Insert a new bucket for non-standard buffer sizes
+      buckets_[buffer_size] = std::vector<WGPUBuffer>{buffer};
+    }
   }
 
   void OnRefresh(GraphCaptureState /*graph_capture_state*/) override {
-    // Initialize buckets if they don't exist yet
-    if (buckets_.empty()) {
-      for (const auto& pair : buckets_limit_) {
-        buckets_.emplace(pair.first, std::vector<WGPUBuffer>());
+    // no-op - buffers are already in buckets_
+  }
+
+  std::vector<std::pair<size_t, WGPUBuffer>> ExtractCachedBuffers() override {
+    std::vector<std::pair<size_t, WGPUBuffer>> result;
+    for (auto& pair : buckets_) {
+      for (auto& buffer : pair.second) {
+        result.emplace_back(pair.first, buffer);
+      }
+      pair.second.clear();
+    }
+    return result;
+  }
+
+  void AbsorbCachedBuffers(std::vector<std::pair<size_t, WGPUBuffer>>&& buffers) override {
+    for (auto& entry : buffers) {
+      if (entry.second) {
+        ReleaseBuffer(entry.second);
       }
     }
-
-    for (auto& buffer : pending_buffers_) {
-      auto buffer_size = static_cast<size_t>(wgpuBufferGetSize(buffer));
-      auto it = buckets_.find(buffer_size);
-      if (it != buckets_.end()) {
-        it->second.emplace_back(buffer);
-      } else {
-        // insert a new bucket if it doesn't exist
-        buckets_[buffer_size] = std::vector<WGPUBuffer>{buffer};
-      }
-    }
-
-    pending_buffers_.clear();
   }
 
   ~GraphCacheManager() {
-    for (auto& buffer : pending_buffers_) {
-      wgpuBufferRelease(buffer);
-    }
     for (auto& pair : buckets_) {
       for (auto& buffer : pair.second) {
         wgpuBufferRelease(buffer);
@@ -321,8 +338,10 @@ class GraphCacheManager : public IBufferCacheManager {
  protected:
   void Initialize() {
     buckets_keys_.reserve(buckets_limit_.size());
+    buckets_.reserve(buckets_limit_.size());
     for (const auto& pair : buckets_limit_) {
       buckets_keys_.push_back(pair.first);
+      buckets_.emplace(pair.first, std::vector<WGPUBuffer>());
     }
     std::sort(buckets_keys_.begin(), buckets_keys_.end());
 
@@ -337,7 +356,6 @@ class GraphCacheManager : public IBufferCacheManager {
   }
   std::unordered_map<size_t, size_t> buckets_limit_;
   std::unordered_map<size_t, std::vector<WGPUBuffer>> buckets_;
-  std::vector<WGPUBuffer> pending_buffers_;
   std::vector<size_t> buckets_keys_;
 };
 
@@ -388,6 +406,37 @@ class GraphSimpleCacheManager : public IBufferCacheManager {
     }
     for (auto& buffer : captured_buffers_) {
       wgpuBufferRelease(buffer);
+    }
+  }
+
+  std::vector<std::pair<size_t, WGPUBuffer>> ExtractCachedBuffers() override {
+    // Donation is expected after captured commands have been released and any
+    // in-flight work has completed; all three containers therefore hold buffers
+    // no longer referenced by the device.
+    std::vector<std::pair<size_t, WGPUBuffer>> result;
+    for (auto& pair : buffers_) {
+      for (auto& buffer : pair.second) {
+        result.emplace_back(pair.first, buffer);
+      }
+      pair.second.clear();
+    }
+    buffers_.clear();
+    for (auto& buffer : pending_buffers_) {
+      result.emplace_back(static_cast<size_t>(wgpuBufferGetSize(buffer)), buffer);
+    }
+    pending_buffers_.clear();
+    for (auto& buffer : captured_buffers_) {
+      result.emplace_back(static_cast<size_t>(wgpuBufferGetSize(buffer)), buffer);
+    }
+    captured_buffers_.clear();
+    return result;
+  }
+
+  void AbsorbCachedBuffers(std::vector<std::pair<size_t, WGPUBuffer>>&& buffers) override {
+    for (auto& entry : buffers) {
+      if (entry.second) {
+        buffers_[entry.first].emplace_back(entry.second);
+      }
     }
   }
 
@@ -442,15 +491,15 @@ std::ostream& operator<<(std::ostream& os, BufferCacheMode mode) {
   return os;
 }
 
-BufferManager::BufferManager(WebGpuContext& context, BufferCacheMode storage_buffer_cache_mode, BufferCacheMode uniform_buffer_cache_mode, BufferCacheMode query_resolve_buffer_cache_mode)
+BufferManager::BufferManager(WebGpuContext& context, BufferCacheMode storage_buffer_cache_mode, BufferCacheMode uniform_buffer_cache_mode, BufferCacheMode query_resolve_buffer_cache_mode, BufferCacheMode default_buffer_cache_mode)
     : context_{context},
       storage_cache_{CreateBufferCacheManager(storage_buffer_cache_mode)},
       uniform_cache_{CreateBufferCacheManager(uniform_buffer_cache_mode)},
       query_resolve_cache_{CreateBufferCacheManager(query_resolve_buffer_cache_mode)},
-      default_cache_{CreateBufferCacheManager(BufferCacheMode::Disabled)} {
+      default_cache_{CreateBufferCacheManager(default_buffer_cache_mode)} {
 }
 
-void BufferManager::Upload(void* src, WGPUBuffer dst, size_t size) const {
+void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuffer dst, size_t size) const {
   // If the buffer is mapped, we can directly write to it.
   void* mapped_data = wgpuBufferGetMappedRange(dst, 0, WGPU_WHOLE_MAP_SIZE);  // ensure the buffer is mapped
   if (mapped_data) {
@@ -460,47 +509,73 @@ void BufferManager::Upload(void* src, WGPUBuffer dst, size_t size) const {
   }
 
   // Otherwise, we need to use a staging buffer to upload data.
-  auto buffer_size = NormalizeBufferSize(size);
+  auto copy_size = NormalizeCopySize(size);
 
   wgpu::BufferDescriptor desc{};
-  desc.size = buffer_size;
+  desc.size = copy_size;
   desc.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::MapWrite;
   desc.mappedAtCreation = true;
 
   auto staging_buffer = context_.Device().CreateBuffer(&desc);
   mapped_data = staging_buffer.GetMappedRange();
   memcpy(mapped_data, src, size);
+  // NOTE: When copy_size != size (due to 4-byte alignment requirement of CopyBufferToBuffer),
+  // the trailing bytes [size, copy_size) in the staging buffer contain uninitialized data.
+  // This dirty data gets copied into the destination buffer and may cause problems.
+  // A possible solution is to use CopyBufferToBuffer for the aligned portion and a compute
+  // shader to write the non-aligned remainder.
   staging_buffer.Unmap();
 
-  auto& command_encoder = context_.GetCommandEncoder();
-  context_.EndComputePass();
-  command_encoder.CopyBufferToBuffer(staging_buffer, 0, dst, 0, buffer_size);
-  context_.Flush(*this);
+  ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
+  auto& command_encoder = context_.GetCommandEncoder(recording);
+  context_.EndComputePass(recording);
+  command_encoder.CopyBufferToBuffer(staging_buffer, 0, dst, 0, copy_size);
+  ORT_THROW_IF_ERROR(context_.Flush(*this, recording));
 }
 
-void BufferManager::MemCpy(WGPUBuffer src, WGPUBuffer dst, size_t size) const {
+void BufferManager::MemCpy(CommandRecordingState& recording, WGPUBuffer src, WGPUBuffer dst, size_t size) const {
   ORT_ENFORCE(src != dst, "Source and destination buffers must be different.");
   EnforceBufferUnmapped(context_, src);
   EnforceBufferUnmapped(context_, dst);
 
-  auto buffer_size = NormalizeBufferSize(size);
+  auto copy_size = NormalizeCopySize(size);
   auto src_size = static_cast<size_t>(wgpuBufferGetSize(src));
   auto dst_size = static_cast<size_t>(wgpuBufferGetSize(dst));
-  ORT_ENFORCE(buffer_size <= src_size && buffer_size <= dst_size,
+  ORT_ENFORCE(copy_size <= src_size && copy_size <= dst_size,
               "Source and destination buffers must have enough space for the copy operation. src_size=",
-              src_size, ", dst_size=", dst_size, ", copy_size=", buffer_size, ".");
+              src_size, ", dst_size=", dst_size, ", copy_size=", copy_size, ".");
 
-  auto& command_encoder = context_.GetCommandEncoder();
-  context_.EndComputePass();
-  command_encoder.CopyBufferToBuffer(src, 0, dst, 0, buffer_size);
+  ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
+  auto& command_encoder = context_.GetCommandEncoder(recording);
+  context_.EndComputePass(recording);
+  command_encoder.CopyBufferToBuffer(src, 0, dst, 0, copy_size);
 }
 
-WGPUBuffer BufferManager::Create(size_t size, wgpu::BufferUsage usage) const {
-  auto& cache = GetCacheManager(usage);
-  auto buffer_size = cache.CalculateBufferSize(size);
-
-  auto buffer = cache.TryAcquireCachedBuffer(buffer_size);
+WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, wgpu::BufferUsage usage,
+                                 bool initialize_to_zero,
+                                 bool submit_zero_initialize) const {
+  size_t buffer_size;
+  WGPUBuffer buffer;
+  {
+    std::lock_guard<std::mutex> lock{mutex_};
+    auto& cache = GetCacheManager(usage);
+    buffer_size = cache.CalculateBufferSize(size);
+    buffer = cache.TryAcquireCachedBuffer(buffer_size);
+  }
   if (buffer) {
+    if (initialize_to_zero) {
+      // Plugin plain allocations pass call-local recording and submit only their own clear.
+      // AllocOnStream defers the clear on the Session timeline. Built-in allocations use the
+      // Session recording and retain their caller-supplied submission policy.
+      auto buffer_guard = wgpu::Buffer::Acquire(buffer);
+      ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
+      context_.EndComputePass(recording);
+      context_.GetCommandEncoder(recording).ClearBuffer(buffer, 0, buffer_size);
+      if (submit_zero_initialize) {
+        ORT_THROW_IF_ERROR(context_.Flush(*this, recording));
+      }
+      return buffer_guard.MoveToCHandle();
+    }
     return buffer;
   }
 
@@ -515,7 +590,10 @@ WGPUBuffer BufferManager::Create(size_t size, wgpu::BufferUsage usage) const {
 
   ORT_ENFORCE(buffer, "Failed to create GPU buffer: size=", buffer_size, ", usage=", uint64_t(usage), ".");
 
-  cache.RegisterBuffer(buffer, size);
+  {
+    std::lock_guard<std::mutex> lock{mutex_};
+    GetCacheManager(usage).RegisterBuffer(buffer, size);
+  }
   return buffer;
 }
 
@@ -528,12 +606,30 @@ bool BufferManager::SupportsUMA() const {
 #endif  // !defined(__wasm__)
 }
 
-void BufferManager::Release(WGPUBuffer buffer) const {
+void BufferManager::Release(WGPUBuffer buffer, const CommandRecordingState* recording) const {
   EnforceBufferUnmapped(context_, buffer);
-  GetCacheManager(buffer).ReleaseBuffer(buffer);
+  std::lock_guard<std::mutex> lock{mutex_};
+  auto& cache = GetCacheManager(buffer);
+  // Keep reusable buffers out of the cache while this recording has unsubmitted work.
+  // Graph caches also need this protection from streamless allocations.
+  // Relaxed ordering suffices: recording a buffer's use (and setting the flag) must happen-before
+  // its release, on the same thread or through a synchronized ownership handoff. Only independent
+  // buffer releases may race with recording. The flag publishes no command data, and mutex_ orders
+  // releases against clearing it after submission or abandonment.
+  if (cache.SupportsBufferReuse() && recording != nullptr &&
+      recording->has_unsubmitted_work.load(std::memory_order_relaxed)) {
+    pending_buffers_[recording].emplace_back(wgpu::Buffer::Acquire(buffer));
+    return;
+  }
+
+  cache.ReleaseBuffer(buffer);
 }
 
-void BufferManager::Download(WGPUBuffer src, void* dst, size_t size) const {
+void BufferManager::Download(CommandRecordingState& recording, WGPUBuffer src, void* dst, size_t size) const {
+  // Encode pending deferred dispatches before recording the readback; the flush below submits both
+  // in order.
+  ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
+
   EnforceBufferUnmapped(context_, src);
   auto buffer_size = NormalizeBufferSize(size);
 
@@ -542,27 +638,78 @@ void BufferManager::Download(WGPUBuffer src, void* dst, size_t size) const {
   desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
 
   auto staging_buffer = context_.Device().CreateBuffer(&desc);
-  auto& command_encoder = context_.GetCommandEncoder();
-  context_.EndComputePass();
+  auto& command_encoder = context_.GetCommandEncoder(recording);
+  context_.EndComputePass(recording);
   command_encoder.CopyBufferToBuffer(src, 0, staging_buffer, 0, buffer_size);
-  context_.Flush(*this);
+  ORT_THROW_IF_ERROR(context_.Flush(*this, recording));
 
   // TODO: revise wait in whole project
 
-  ORT_ENFORCE(context_.Wait(staging_buffer.MapAsync(wgpu::MapMode::Read, 0, buffer_size, wgpu::CallbackMode::WaitAnyOnly, [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-    ORT_ENFORCE(status == wgpu::MapAsyncStatus::Success, "Failed to download data from buffer: ", std::string_view{message});
-  })) == Status::OK());
+  struct MapAsyncResult {
+    wgpu::MapAsyncStatus status{};
+    std::string message{};
+  } map_async_result;
+
+  ORT_THROW_IF_ERROR(context_.Wait(
+      staging_buffer.MapAsync(
+          wgpu::MapMode::Read, 0, buffer_size, wgpu::CallbackMode::WaitAnyOnly,
+          // Note: Don't throw from a Dawn callback.
+          [](wgpu::MapAsyncStatus status, wgpu::StringView message,
+             MapAsyncResult* result) noexcept {
+            result->status = status;
+            if (auto message_sv = static_cast<std::string_view>(message);
+                !message_sv.empty()) {
+              result->message = std::string{message_sv};
+            }
+          },
+          &map_async_result)));
+
+  ORT_ENFORCE(map_async_result.status == wgpu::MapAsyncStatus::Success,
+              "Failed to download data from buffer. wgpu::MapAsyncStatus value: ",
+              static_cast<int>(map_async_result.status), ", message: ", map_async_result.message);
 
   auto mapped_data = staging_buffer.GetConstMappedRange();
   memcpy(dst, mapped_data, size);
   staging_buffer.Unmap();
 }
 
-void BufferManager::RefreshPendingBuffers(GraphCaptureState graph_capture_state) const {
+void BufferManager::RefreshPendingBuffers(CommandRecordingState& recording, GraphCaptureState graph_capture_state) const {
+  std::lock_guard<std::mutex> lock{mutex_};
+  // Serialize the transition to idle with Free, so a concurrent release cannot miss this refresh.
+  recording.has_unsubmitted_work.store(false, std::memory_order_relaxed);
+  if (auto it = pending_buffers_.find(&recording); it != pending_buffers_.end()) {
+    for (auto& buffer : it->second) {
+      GetCacheManager(buffer.Get()).ReleaseBuffer(buffer.MoveToCHandle());
+    }
+    pending_buffers_.erase(it);
+  }
+
+  if (graph_capture_state == GraphCaptureState::Replaying) {
+    return;
+  }
+
   storage_cache_->OnRefresh(graph_capture_state);
   uniform_cache_->OnRefresh(graph_capture_state);
   query_resolve_cache_->OnRefresh(graph_capture_state);
   default_cache_->OnRefresh(graph_capture_state);
+}
+
+void BufferManager::DiscardPendingBuffers(CommandRecordingState& recording) const {
+  std::lock_guard<std::mutex> lock{mutex_};
+  recording.has_unsubmitted_work.store(false, std::memory_order_relaxed);
+  pending_buffers_.erase(&recording);
+}
+
+std::vector<std::pair<size_t, WGPUBuffer>> BufferManager::ExtractCachedBuffers(wgpu::BufferUsage usage) {
+  std::lock_guard<std::mutex> lock{mutex_};
+  return GetCacheManager(usage).ExtractCachedBuffers();
+}
+
+void BufferManager::AbsorbCachedBuffers(
+    wgpu::BufferUsage usage,
+    std::vector<std::pair<size_t, WGPUBuffer>>&& buffers) {
+  std::lock_guard<std::mutex> lock{mutex_};
+  GetCacheManager(usage).AbsorbCachedBuffers(std::move(buffers));
 }
 
 IBufferCacheManager& BufferManager::GetCacheManager(wgpu::BufferUsage usage) const {
@@ -582,8 +729,8 @@ IBufferCacheManager& BufferManager::GetCacheManager(WGPUBuffer buffer) const {
   return GetCacheManager(usage);
 }
 
-std::unique_ptr<BufferManager> BufferManagerFactory::Create(WebGpuContext& context, BufferCacheMode storage_buffer_cache_mode, BufferCacheMode uniform_buffer_cache_mode, BufferCacheMode query_resolve_buffer_cache_mode) {
-  return std::make_unique<BufferManager>(context, storage_buffer_cache_mode, uniform_buffer_cache_mode, query_resolve_buffer_cache_mode);
+std::unique_ptr<BufferManager> BufferManagerFactory::Create(WebGpuContext& context, BufferCacheMode storage_buffer_cache_mode, BufferCacheMode uniform_buffer_cache_mode, BufferCacheMode query_resolve_buffer_cache_mode, BufferCacheMode default_buffer_cache_mode) {
+  return std::make_unique<BufferManager>(context, storage_buffer_cache_mode, uniform_buffer_cache_mode, query_resolve_buffer_cache_mode, default_buffer_cache_mode);
 }
 
 }  // namespace webgpu

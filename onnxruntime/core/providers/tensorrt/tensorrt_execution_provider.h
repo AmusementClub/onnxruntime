@@ -16,6 +16,14 @@ typedef void* cudnnStatus_t;
 #include "core/providers/cuda/cuda_graph.h"
 #include "tensorrt_execution_provider_info.h"
 
+// These types used to come from NvOnnxParser.h, but they've been removed.
+#if NV_TENSORRT_MAJOR >= 11
+#include <utility>
+#include <vector>
+using SubGraph_t = std::pair<std::vector<size_t>, bool>;
+using SubGraphCollection_t = std::vector<SubGraph_t>;
+#endif
+
 namespace onnxruntime {
 
 namespace tensorrt_env_vars {
@@ -280,6 +288,11 @@ class TensorrtExecutionProvider : public IExecutionProvider {
                 const GraphOptimizerRegistry& graph_optimizer_registry,
                 IResourceAccountant* /* resource_accountant */) const override;
 
+  uint32_t GetEpContextDataCallbackRequirements(const GraphViewer&) const override {
+    return dump_ep_context_model_ && ep_context_embed_mode_ == 0 ? OrtEpContextDataCallbackSupportFlags_WRITE
+                                                                 : OrtEpContextDataCallbackSupportFlags_NONE;
+  }
+
   int GetDeviceId() const { return device_id_; }
 
   common::Status Compile(const std::vector<FusedNodeAndGraph>& fused_nodes_and_graphs,
@@ -302,12 +315,11 @@ class TensorrtExecutionProvider : public IExecutionProvider {
 
   bool IsGraphCaptureEnabled() const override;
   bool IsGraphCaptured(int graph_annotation_id) const override;
-  Status ReplayGraph(int graph_annotation_id) override;
+  Status ReplayGraph(int graph_annotation_id, bool sync = true) override;
 
   static common::Status RefitEngine(std::string onnx_model_filename,
                                     std::string& onnx_model_folder_path,
                                     std::string& weight_stripped_engine_cath_path,
-                                    bool path_check,
                                     const void* onnx_model_bytestream,
                                     size_t onnx_model_bytestream_size,
                                     const void* onnx_external_data_bytestream,

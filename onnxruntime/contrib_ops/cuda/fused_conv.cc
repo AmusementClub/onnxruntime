@@ -95,15 +95,10 @@ class FusedConv : public onnxruntime::cuda::CudaKernel {
     s_.w_data = reinterpret_cast<const CudaT*>(W->Data<T>());
 
     // set B
-    if (context->InputCount() >= 3) {
-      const Tensor* B = context->Input<Tensor>(2);
-      s_.b_data = reinterpret_cast<const CudaT*>(B->Data<T>());
-    } else {
-      s_.b_data = nullptr;
-    }
+    const Tensor* B = context->InputCount() > 2 ? context->Input<Tensor>(2) : nullptr;
+    s_.b_data = B ? reinterpret_cast<const CudaT*>(B->Data<T>()) : nullptr;
     // set Z
-    if (context->InputCount() >= 4) {
-      const Tensor* Z = context->Input<Tensor>(3);
+    if (const Tensor* Z = context->InputCount() > 3 ? context->Input<Tensor>(3) : nullptr) {
       ORT_RETURN_IF_ERROR(s_.z_tensor.Set(Z->Shape().GetDims(),
                                           ::onnxruntime::cuda::CudnnTensor::GetDataType<CudaT>()));
       s_.z_data = reinterpret_cast<const CudaT*>(Z->Data<T>());
@@ -181,7 +176,7 @@ class FusedConv : public onnxruntime::cuda::CudaKernel {
         // Post slicing needed. Create and fill in the Conv results in an intermediate buffer.
         s_.memory_for_cudnn_conv_results =
             GetScratchBuffer<void>(TensorShape(y_dims_with_adjusted_pads).Size() * s_.element_size,
-                                   context->GetComputeStream());
+                                   GetComputeStream(context));
         s_.y_data = reinterpret_cast<CudaT*>(s_.memory_for_cudnn_conv_results.get());
       } else {
         // No post slicing needed. Fill the output tensor's buffer directly.
@@ -239,8 +234,7 @@ class FusedConv : public onnxruntime::cuda::CudaKernel {
                                            gsl::narrow_cast<int>(conv_attrs_.group), CUDNN_CROSS_CORRELATION,
                                            ::onnxruntime::cuda::CudnnTensor::GetDataType<CudaT>(), UseTF32()));
 
-      if (context->InputCount() >= 3) {
-        const Tensor* B = context->Input<Tensor>(2);
+      if (B != nullptr) {
         const auto& b_shape = B->Shape();
         ORT_RETURN_IF_NOT(b_shape.NumDimensions() == 1, "bias should be 1D");
         TensorShapeVector b_dims(2 + kernel_shape.size(), 1);
@@ -338,7 +332,7 @@ class FusedConv : public onnxruntime::cuda::CudaKernel {
       }
       if (s_.post_slicing_required) {
         s_.memory_for_cudnn_conv_results = GetScratchBuffer<void>(
-            TensorShape(s_.y_dims_with_adjusted_pads).Size() * s_.element_size, context->GetComputeStream());
+            TensorShape(s_.y_dims_with_adjusted_pads).Size() * s_.element_size, GetComputeStream(context));
         s_.y_data = reinterpret_cast<CudaT*>(s_.memory_for_cudnn_conv_results.get());
       } else {
         s_.y_data = reinterpret_cast<CudaT*>(s_.Y->MutableData<T>());
@@ -358,7 +352,7 @@ class FusedConv : public onnxruntime::cuda::CudaKernel {
     bool has_b = nullptr != s_.b_data;
     const auto alpha = onnxruntime::cuda::Consts<CudaT>::One;
     const auto beta = onnxruntime::cuda::Consts<CudaT>::Zero;
-    IAllocatorUniquePtr<void> workspace = GetWorkSpace(context->GetComputeStream());
+    IAllocatorUniquePtr<void> workspace = GetWorkSpace(GetComputeStream(context));
     auto cudnn_status = cudnnConvolutionBiasActivationForward(cudnnHandle,
                                                               &alpha,
                                                               s_.x_tensor,
@@ -422,7 +416,7 @@ class FusedConv : public onnxruntime::cuda::CudaKernel {
     return Status::OK();
   }
 
-  inline IAllocatorUniquePtr<void> GetWorkSpace(onnxruntime::Stream* stream) const {
+  inline IAllocatorUniquePtr<void> GetWorkSpace(void* stream) const {
     return GetScratchBuffer<void>(s_.workspace_bytes, stream);
   }
 

@@ -4,6 +4,7 @@
 // this file contains implementations of the C API
 
 #include <cassert>
+#include <utility>
 
 #include "ort_env.h"
 #include "core/session/ort_apis.h"
@@ -19,7 +20,7 @@ std::atomic<bool> g_is_shutting_down(false);
 using namespace onnxruntime;
 using namespace onnxruntime::logging;
 
-#ifdef USE_WEBGPU
+#if defined(USE_WEBGPU) && !defined(ORT_USE_EP_API_ADAPTERS)
 namespace onnxruntime {
 namespace webgpu {
 void CleanupWebGpuContexts();
@@ -29,27 +30,35 @@ void CleanupWebGpuContexts();
 
 OrtEnv* OrtEnv::p_instance_;
 int OrtEnv::ref_count_ = 0;
-std::mutex OrtEnv::m_;
+std::recursive_mutex OrtEnv::m_;
 
 OrtEnv::OrtEnv(std::unique_ptr<onnxruntime::Environment> value1)
     : value_(std::move(value1)) {
 }
 
 OrtEnv::~OrtEnv() {
-#ifdef USE_WEBGPU
-  webgpu::CleanupWebGpuContexts();
-#endif
-
 // We don't support any shared providers in the minimal build yet
 #if !defined(ORT_MINIMAL_BUILD)
   UnloadSharedProviders();
 #endif
+
+#if defined(USE_WEBGPU) && !defined(ORT_USE_EP_API_ADAPTERS)
+  // Explicitly destroy the Environment first, which will properly clean up DataTransferManager
+  // and call ReleaseImpl on WebGpuDataTransferImpl
+  value_.reset();
+
+  // Now that Environment is destroyed and all data transfers are cleaned up,
+  // we can safely cleanup any remaining WebGPU contexts
+  webgpu::CleanupWebGpuContexts();
+#endif
 }
 
-OrtEnv* OrtEnv::GetInstance(const OrtEnv::LoggingManagerConstructionInfo& lm_info,
-                            onnxruntime::common::Status& status,
-                            const OrtThreadingOptions* tp_options) {
-  std::lock_guard<std::mutex> lock(m_);
+/*static*/
+OrtEnvPtr OrtEnv::GetOrCreateInstance(const OrtEnv::LoggingManagerConstructionInfo& lm_info,
+                                      onnxruntime::common::Status& status,
+                                      const OrtThreadingOptions* tp_options,
+                                      const OrtKeyValuePairs* config_entries) {
+  std::lock_guard<std::recursive_mutex> lock(m_);
   if (!p_instance_) {
     std::unique_ptr<LoggingManager> lmgr;
     std::string name = lm_info.logid;
@@ -70,24 +79,44 @@ OrtEnv* OrtEnv::GetInstance(const OrtEnv::LoggingManagerConstructionInfo& lm_inf
                                             LoggingManager::InstanceType::Default,
                                             &name);
 
+    const bool create_global_thread_pools = tp_options != nullptr;
     std::unique_ptr<onnxruntime::Environment> env;
-    if (!tp_options) {
-      status = onnxruntime::Environment::Create(std::move(lmgr), env);
-    } else {
-      status = onnxruntime::Environment::Create(std::move(lmgr), env, tp_options, true);
-    }
+    status = onnxruntime::Environment::Create(std::move(lmgr), env, tp_options,
+                                              create_global_thread_pools, config_entries);
+
     if (!status.IsOK()) {
-      return nullptr;
+      return OrtEnvPtr(nullptr, OrtEnv::Release);
     }
     // Use 'new' to allocate OrtEnv, as it will be managed by p_instance_
     // and deleted in ReleaseEnv or leaked if g_is_process_shutting_down is true.
     p_instance_ = new OrtEnv(std::move(env));
+
+    // Take this caller's reference before running any execution provider code below, so that if a provider
+    // acquires and releases an OrtEnvPtr the instance isn't destroyed out from under us. Holding it in an OrtEnvPtr
+    // also unpublishes and destroys the half-built instance if anything below fails or throws.
+    ++ref_count_;
+    OrtEnvPtr instance{p_instance_, OrtEnv::Release};
+
+#if !defined(ORT_MINIMAL_BUILD)
+    // Register statically linked plugin EPs *after* p_instance_ is published. They use the public ORT API, so any
+    // OrtEnv API they call while enumerating their devices must be able to find the instance. m_ is recursive so
+    // that such a call from this thread doesn't self-deadlock.
+    status = p_instance_->GetEnvironment().CreateAndRegisterStaticPluginEps(
+        Environment::StaticPluginEpRegistrationToken{});
+
+    if (!status.IsOK()) {
+      return OrtEnvPtr(nullptr, OrtEnv::Release);
+    }
+#endif  // !defined(ORT_MINIMAL_BUILD)
+
+    return instance;
   }
 
   ++ref_count_;
-  return p_instance_;
+  return OrtEnvPtr(p_instance_, OrtEnv::Release);
 }
 
+/*static*/
 void OrtEnv::Release(OrtEnv* env_ptr) {
   if (!env_ptr) {
     return;  // nothing to release
@@ -96,7 +125,7 @@ void OrtEnv::Release(OrtEnv* env_ptr) {
   OrtEnv* instance_to_delete = nullptr;
 
   {  // Scope for the lock guard
-    std::lock_guard<std::mutex> lock(m_);
+    std::lock_guard<std::recursive_mutex> lock(m_);
     assert(p_instance_ == env_ptr);
 
     --ref_count_;
@@ -123,6 +152,17 @@ void OrtEnv::Release(OrtEnv* env_ptr) {
   // Perform the deletion outside the lock if an instance was marked for deletion.
   // instance_to_delete can be null here, but it's perfectly safe to delete a nullptr
   delete instance_to_delete;
+}
+
+/*static*/
+OrtEnvPtr OrtEnv::TryGetInstance() {
+  std::lock_guard<std::recursive_mutex> lock(m_);
+
+  if (p_instance_) {
+    ++ref_count_;
+  }
+
+  return OrtEnvPtr(p_instance_, OrtEnv::Release);
 }
 
 onnxruntime::logging::LoggingManager* OrtEnv::GetLoggingManager() const {

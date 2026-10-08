@@ -198,8 +198,7 @@ bool IsMatMulInputTypeSupported(const Node& node) {
   // if no matching key is present, any data type is allowed
   static const InlinedHashMap<std::string_view, InlinedVector<std::string_view, 4>> k_supported_data_types{
       {kCudaExecutionProvider, {"tensor(float16)", "tensor(float)", "tensor(double)", "tensor(bfloat16)"}},
-      {kRocmExecutionProvider, {"tensor(float16)", "tensor(float)", "tensor(double)", "tensor(bfloat16)"}},
-      {kCpuExecutionProvider, {"tensor(float)"}},
+      {kCpuExecutionProvider, {"tensor(float)", "tensor(double)"}},
   };
 
   const auto it = k_supported_data_types.find(node.GetExecutionProviderType());
@@ -297,10 +296,14 @@ Status ProcessNode(
       nodes_to_remove.push_back(get_mutable_node_to_merge(output_node_merge));
     }
 
+    InlinedVector<NodeIndex> source_node_indices;
+    source_node_indices.reserve(nodes_to_remove.size());
     for (Node& node_to_remove : nodes_to_remove) {
+      source_node_indices.push_back(node_to_remove.Index());
       graph_utils::RemoveNodeOutputEdges(graph, node_to_remove);
       graph.RemoveNode(node_to_remove.Index());
     }
+    graph.NotifyNodeReplacement(source_node_indices, matmul_scale_node.Index());
   }
 
   modified = true;

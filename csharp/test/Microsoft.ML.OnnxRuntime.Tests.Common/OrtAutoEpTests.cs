@@ -18,6 +18,7 @@ using System.Collections.Generic;
 /// Includes testing of OrtHardwareDevice and OrtEpDevice as those only come from auto ep related code and we only
 /// get read-only access to them (i.e. we can't directly create instances of them to test).
 /// </summary>
+[Collection("Ort Inference Tests")]
 public class OrtAutoEpTests
 {
     private OrtEnv ortEnvInstance = OrtEnv.Instance();
@@ -60,6 +61,8 @@ public class OrtAutoEpTests
             Assert.NotNull(metadata);
             var options = ep_device.EpOptions;
             Assert.NotNull(options);
+            var memInfo = ep_device.GetMemoryInfo(OrtDeviceMemoryType.DEFAULT);
+            Assert.NotNull(memInfo);
             ReadHardwareDeviceValues(ep_device.HardwareDevice);
         }
     }
@@ -77,14 +80,17 @@ public class OrtAutoEpTests
 
             // register. shouldn't throw
             ortEnvInstance.RegisterExecutionProviderLibrary(epName, libFullPath);
-
-            // check OrtEpDevice was found
-            var epDevices = ortEnvInstance.GetEpDevices();
-            var found = epDevices.Any(d => string.Equals(epName, d.EpName, StringComparison.OrdinalIgnoreCase));
-            Assert.True(found);
-
-            // unregister
-            ortEnvInstance.UnregisterExecutionProviderLibrary(epName);
+            try
+            {
+                // check OrtEpDevice was found
+                var epDevices = ortEnvInstance.GetEpDevices();
+                var found = epDevices.Any(d => string.Equals(epName, d.EpName, StringComparison.OrdinalIgnoreCase));
+                Assert.True(found);
+            }
+            finally
+            {   // unregister
+                ortEnvInstance.UnregisterExecutionProviderLibrary(epName);
+            }
         }
     }
 

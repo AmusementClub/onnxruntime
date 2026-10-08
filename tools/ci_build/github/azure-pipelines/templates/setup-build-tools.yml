@@ -1,0 +1,48 @@
+# Setup python/nodejs/cmake/vcpkg tools. Also, setup telemetry header file if the current OS is Windows.
+
+parameters:
+# for selecting python binary
+- name: host_cpu_arch
+  type: string
+
+- name: python_version
+  type: string
+  default: '3.12'
+
+- name: action_version
+  type: string
+  default: 'v0.0.9'
+
+steps:
+- template: telemetry-steps.yml
+
+- template: setup-feeds-and-python-steps.yml
+  parameters:
+    versionSpec: ${{ parameters.python_version }}
+    architecture: ${{ parameters.host_cpu_arch }}
+
+- task: UseNode@1
+  inputs:
+    version: '24.x'
+
+- script: |
+    node -v
+    npm -v
+  displayName: 'Display Node.js Version'
+
+- script: |
+    python3 -m pip install requests truststore
+  displayName: 'Install Python requests package'
+
+- powershell: |
+    Write-Host "Process: $env:NO_PROXY"
+    Write-Host "User:    $([Environment]::GetEnvironmentVariable('NO_PROXY', 'User'))"
+    Write-Host "Machine: $([Environment]::GetEnvironmentVariable('NO_PROXY', 'Machine'))"
+  displayName: Inspect proxy environment
+
+- powershell: |
+    $env:NO_PROXY = (($env:NO_PROXY -split ',') |
+      Where-Object { $_ -ne '::1' -and $_ -notmatch '/' }) -join ','
+
+    python tools/ci_build/run_gh_action.py ${{ parameters.action_version }}
+  displayName: Run GitHub Action via Python Wrapper

@@ -13,6 +13,7 @@
 
 #include "nccl_kernels.h"
 #include "mpi_include.h"
+#include "core/common/safeint.h"
 #include "core/providers/cpu/tensor/slice.h"
 #include "core/providers/cuda/tensor/slice.h"
 #include "core/providers/cuda/math/matmul.h"
@@ -38,6 +39,8 @@ ncclDataType_t GetNcclDataType(onnxruntime::MLDataType type) {
     return ncclInt64;
   } else if (type == DataTypeImpl::GetType<MLFloat16>()) {
     return ncclFloat16;
+  } else if (type == DataTypeImpl::GetType<BFloat16>()) {
+    return ncclBfloat16;
   } else if (type == DataTypeImpl::GetType<float>()) {
     return ncclFloat32;
   } else if (type == DataTypeImpl::GetType<double>()) {
@@ -259,7 +262,6 @@ Status AllReduce::ComputeInternal(OpKernelContext* context) const {
 
   void* output_data = context->Output(0, in_shape)->MutableDataRaw();
 
-#ifndef USE_ROCM
   return FuncCustomAllReduce(nccl_,
                              Stream(context),
                              input_data,
@@ -267,17 +269,11 @@ Status AllReduce::ComputeInternal(OpKernelContext* context) const {
                              input_count,
                              input_tensor->DataType(),
                              onnxruntime::cuda::collective::IPCMemoryResourcePack::GetGlobalInstance());
-#else
-  ncclComm_t comm = nccl_->Comm();
-  ncclDataType_t dtype = GetNcclDataType(input_tensor->DataType());
-  NCCL_RETURN_IF_ERROR(ncclAllReduce(input_data, output_data, input_count, dtype, ncclSum, comm, Stream(context)));
-  return Status::OK();
-#endif
 }
 
 AllGather::AllGather(const OpKernelInfo& info) : NcclKernel(info) {
   info.GetAttrOrDefault("group_size", &group_size_, static_cast<int64_t>(1));
-  info.GetAttrOrDefault("axis", &axis_, static_cast<int64_t>(0));
+  info.GetAttrOrDefault("axis", &axis_, static_cast<int64_t>(1));
   cuda_ep_ = static_cast<const CUDAExecutionProvider*>(info.GetExecutionProvider());
 }
 
@@ -287,6 +283,13 @@ Status AllGather::ComputeInternal(OpKernelContext* context) const {
   auto input_tensor = context->Input<Tensor>(0);
   const void* input_data = input_tensor->DataRaw();
   const auto& in_shape = input_tensor->Shape();
+  ORT_RETURN_IF_NOT(axis_ >= 0 && axis_ < static_cast<int64_t>(in_shape.NumDimensions()),
+                    "axis must be in the range [0, ", in_shape.NumDimensions(), ")");
+  ORT_RETURN_IF_NOT(group_size_ == nccl_->Size(),
+                    "group_size must match the NCCL communicator size");
+
+  const size_t axis_index = static_cast<size_t>(axis_);
+  const int64_t output_axis_size = SafeInt<int64_t>(in_shape[axis_index]) * group_size_;
   int64_t input_count = in_shape.Size();
 
   if (axis_ > 0) {
@@ -319,7 +322,7 @@ Status AllGather::ComputeInternal(OpKernelContext* context) const {
                                                                   permutation, *input_tensor, *temp_input));
     // Allocate a tempoarary buffer for all gather
     TensorShape all_gather_out_shape(transposed_input_dims);
-    all_gather_out_shape[0] = group_size_ * all_gather_out_shape[0];
+    all_gather_out_shape[0] = output_axis_size;
     auto all_gather_output = Tensor::Create(temp_input->DataType(), all_gather_out_shape, alloc);
     ncclDataType_t dtype = GetNcclDataType(temp_input->DataType());
     NCCL_RETURN_IF_ERROR(ncclAllGather(temp_input->DataRaw(),
@@ -329,7 +332,7 @@ Status AllGather::ComputeInternal(OpKernelContext* context) const {
     temp_input.release();
     // transpose to output
     TensorShape out_shape(in_shape);
-    out_shape[axis_] = group_size_ * out_shape[axis_];
+    out_shape[axis_index] = output_axis_size;
     auto* output_tensor = context->Output(0, out_shape);
 
     return onnxruntime::cuda::Transpose::DoTranspose(cuda_ep_->GetDeviceProp(),
@@ -339,7 +342,7 @@ Status AllGather::ComputeInternal(OpKernelContext* context) const {
   } else {
     // construct output shape
     TensorShape out_shape(in_shape);
-    out_shape[axis_] = group_size_ * out_shape[axis_];
+    out_shape[axis_index] = output_axis_size;
 
     void* output_data = context->Output(0, out_shape)->MutableDataRaw();
 
@@ -389,7 +392,10 @@ ONNX_OPERATOR_KERNEL_EX(
     (*KernelDefBuilder::Create())
         .VariadicAlias(0, 0)  // outputs and inputs are mapped one to one
         .AllocateInputsContiguously()
-        .TypeConstraint("T", DataTypeImpl::AllIEEEFloatTensorTypes()),
+        .TypeConstraint("T", {DataTypeImpl::GetTensorType<float>(),
+                              DataTypeImpl::GetTensorType<double>(),
+                              DataTypeImpl::GetTensorType<MLFloat16>(),
+                              DataTypeImpl::GetTensorType<BFloat16>()}),
     AllReduce);
 
 ONNX_OPERATOR_KERNEL_EX(
@@ -428,7 +434,6 @@ Status FuncAllReduce(
   return Status::OK();
 }
 
-#ifndef USE_ROCM
 Status FuncCustomAllReduce(
     NcclContext* nccl,
     cudaStream_t stream,
@@ -478,7 +483,6 @@ Status FuncCustomAllReduce(
 
   return Status::OK();
 }
-#endif
 
 static std::vector<size_t> CalculatePermToSwapAxes(
     const int64_t axis,

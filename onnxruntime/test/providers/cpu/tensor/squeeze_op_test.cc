@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "gtest/gtest.h"
+#include "core/session/onnxruntime_session_options_config_keys.h"
 #include "test/common/dnnl_op_test_utils.h"
 #include "test/providers/provider_test_utils.h"
 #include "test/util/include/default_providers.h"
@@ -16,6 +17,40 @@ TEST(SqueezeOpTest, Squeeze_1) {
   OpTester test("Squeeze");
   test.AddAttribute("axes", std::vector<int64_t>{0});
   test.AddInput<float>("data", {1, 3, 4, 5}, std::vector<float>(60, 1.0f));
+  test.AddOutput<float>("squeezed", {3, 4, 5}, std::vector<float>(60, 1.0f));
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider});  // Incorrect precision. Will be re-enabled after it's fixed
+}
+
+TEST(SqueezeOpTest, Squeeze_21) {
+  OpTester test("Squeeze", 21);
+  test.AddInput<float>("data", {1, 3, 4, 5}, std::vector<float>(60, 1.0f));
+  test.AddInput<int64_t>("axes", {1}, std::vector<int64_t>{0});
+  test.AddOutput<float>("squeezed", {3, 4, 5}, std::vector<float>(60, 1.0f));
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider});  // Incorrect precision. Will be re-enabled after it's fixed
+}
+
+TEST(SqueezeOpTest, MissingAxesCUDA) {
+  auto cuda_ep = DefaultCudaExecutionProvider();
+  if (!cuda_ep) {
+    GTEST_SKIP() << "CUDA execution provider is not available.";
+  }
+
+  OpTester test("Squeeze", 13);
+  test.AddInput<float>("data", {1, 2, 1}, {1.f, 2.f});
+  test.AddOptionalInputEdge<int64_t>();
+  test.AddOutput<float>("squeezed", {2}, {1.f, 2.f});
+
+  SessionOptions options;
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1"));
+  std::vector<std::unique_ptr<IExecutionProvider>> providers;
+  providers.push_back(std::move(cuda_ep));
+  test.Run(options, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &providers);
+}
+
+TEST(SqueezeOpTest, Squeeze_23) {
+  OpTester test("Squeeze", 23);
+  test.AddInput<float>("data", {1, 3, 4, 5}, std::vector<float>(60, 1.0f));
+  test.AddInput<int64_t>("axes", {1}, std::vector<int64_t>{0});
   test.AddOutput<float>("squeezed", {3, 4, 5}, std::vector<float>(60, 1.0f));
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", {kOpenVINOExecutionProvider});  // Incorrect precision. Will be re-enabled after it's fixed
 }

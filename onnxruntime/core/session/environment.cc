@@ -3,9 +3,12 @@
 
 #include "core/session/environment.h"
 
+#include <algorithm>
 #include <array>
+#include <gsl/gsl>
 
 #include "core/common/basic_types.h"
+#include "core/common/safeint.h"
 #include "core/framework/allocator.h"
 #include "core/framework/allocator_utils.h"
 #include "core/framework/error_code_helper.h"
@@ -16,10 +19,14 @@
 #include "core/session/abi_session_options_impl.h"
 #include "core/session/allocator_adapters.h"
 #include "core/session/inference_session.h"
+#include "core/session/onnxruntime_env_config_keys.h"
+#include "core/session/onnxruntime_ep_device_ep_metadata_keys.h"
+#include "core/session/plugin_ep/ep_allocator_utils.h"
 #include "core/session/plugin_ep/ep_factory_internal.h"
 #include "core/session/plugin_ep/ep_library_internal.h"
 #include "core/session/plugin_ep/ep_library_plugin.h"
 #include "core/session/plugin_ep/ep_library_provider_bridge.h"
+#include "core/session/plugin_ep/ep_static_plugins.h"
 #include "core/session/ort_apis.h"
 #include "core/session/utils.h"
 
@@ -58,6 +65,10 @@
 #include "orttraining/core/optimizer/graph_transformer_registry.h"
 #endif
 
+#if !defined(NDEBUG) && defined(__linux__) && !defined(__ANDROID__)
+#include "absl/debugging/symbolize.h"
+#endif
+
 #if defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
 #include "core/providers/cuda/cuda_provider_factory.h"
 #include "core/providers/cuda/cuda_execution_provider_info.h"
@@ -67,6 +78,7 @@ using namespace ::onnxruntime::common;
 using namespace ONNX_NAMESPACE;
 
 std::once_flag schemaRegistrationOnceFlag;
+std::once_flag symbolizerInitOnceFlag;
 #if defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
 ProviderInfo_CUDA& GetProviderInfo_CUDA();
 #endif  // defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
@@ -120,9 +132,11 @@ std::unordered_set<OrtAllocator*>::const_iterator FindExistingAllocator(const st
 Status Environment::Create(std::unique_ptr<logging::LoggingManager> logging_manager,
                            std::unique_ptr<Environment>& environment,
                            const OrtThreadingOptions* tp_options,
-                           bool create_global_thread_pools) {
+                           bool create_global_thread_pools,
+                           const OrtKeyValuePairs* config_entries) {
   environment = std::make_unique<Environment>();
-  auto status = environment->Initialize(std::move(logging_manager), tp_options, create_global_thread_pools);
+  auto status = environment->Initialize(std::move(logging_manager), tp_options, create_global_thread_pools,
+                                        config_entries);
   return status;
 }
 
@@ -242,15 +256,38 @@ Status Environment::CreateAndRegisterAllocator(const OrtMemoryInfo& mem_info, co
 
 Status Environment::Initialize(std::unique_ptr<logging::LoggingManager> logging_manager,
                                const OrtThreadingOptions* tp_options,
-                               bool create_global_thread_pools) {
+                               bool create_global_thread_pools,
+                               const OrtKeyValuePairs* config_entries) {
   auto status = Status::OK();
 
   logging_manager_ = std::move(logging_manager);
+
+  if (config_entries != nullptr) {
+    config_entries_ = *config_entries;
+
+    const auto& config_map = config_entries_.Entries();
+
+    if (auto iter = config_map.find(kOrtEnvAllowVirtualDevices);
+        iter != config_map.end() && iter->second == "1") {
+      num_allow_virtual_device_uses_ = 1;
+    }
+  }
 
   // create thread pools
   if (create_global_thread_pools) {
     ORT_RETURN_IF_ERROR(SetGlobalThreadingOptions(*tp_options));
   }
+
+  // Initialize abseil symbolizer for readable stack traces in debug builds.
+  // Restricted to Linux: InitializeSymbolizer(nullptr) relies on /proc/self/exe
+  // to locate the executable, which is Linux-specific. Other platforms either
+  // use a different mechanism (Windows: C++23 <stacktrace>) or would need a real
+  // argv[0] path plumbed through, which is out of scope for this debug helper.
+#if !defined(NDEBUG) && defined(__linux__) && !defined(__ANDROID__)
+  std::call_once(symbolizerInitOnceFlag, []() {
+    absl::InitializeSymbolizer(nullptr);
+  });
+#endif
 
   ORT_TRY {
 #if !defined(ORT_MINIMAL_BUILD)
@@ -288,15 +325,18 @@ Status Environment::Initialize(std::unique_ptr<logging::LoggingManager> logging_
 #ifdef USE_DML
       dml::RegisterDmlSchemas();
 #endif
-      RegisterOnnxOperatorSetSchema();
+      // ONNX registers these schemas automatically unless static registration was disabled at build time.
+      if (ONNX_NAMESPACE::IsOnnxStaticRegistrationDisabled()) {
+        RegisterOnnxOperatorSetSchema();
 
 #ifndef DISABLE_ML_OPS
-      RegisterOnnxMLOperatorSetSchema();
+        RegisterOnnxMLOperatorSetSchema();
 #endif
 
 #if defined(ENABLE_TRAINING_OPS)
-      RegisterOnnxTrainingOperatorSetSchema();
+        RegisterOnnxTrainingOperatorSetSchema();
 #endif
+      }
 
 #if defined(ENABLE_TRAINING_OPS)
       // preserve this order until <training schemas>: this depends on operatorsetschema registration.
@@ -403,9 +443,11 @@ Status Environment::CreateAndRegisterAllocatorV2(const std::string& provider_typ
 #if defined(USE_CUDA) || defined(USE_CUDA_PROVIDER_INTERFACE)
   if (provider_type == onnxruntime::kCudaExecutionProvider) {
     if (mem_info.device.MemType() == OrtDevice::MemType::HOST_ACCESSIBLE) {
-      AllocatorPtr allocator_ptr = GetProviderInfo_CUDA().CreateCUDAPinnedAllocator(
+      AllocatorPtr allocator_ptr = GetProviderInfo_CUDA().CreateCudaPinnedAllocator(
           static_cast<int16_t>(mem_info.device.Id()),
-          onnxruntime::CUDA_PINNED);
+          arena_cfg->max_mem,
+          static_cast<ArenaExtendStrategy>(arena_cfg->arena_extend_strategy),
+          arena_cfg);
       return RegisterAllocatorImpl(allocator_ptr);
     } else {
       CUDAExecutionProviderInfo cuda_ep_info;
@@ -424,6 +466,13 @@ Status Environment::CreateAndRegisterAllocatorV2(const std::string& provider_typ
   return Status{ONNXRUNTIME, common::INVALID_ARGUMENT,
                 provider_type + " is not implemented in CreateAndRegisterAllocatorV2()"};
 }
+
+#ifdef ORT_ENABLE_SESSION_THREADPOOL_CALLBACKS
+Status Environment::SetPerSessionWorkCallbacks(const OrtThreadPoolCallbacksConfig& config) {
+  per_session_work_callbacks_ = config;
+  return Status::OK();
+}
+#endif
 
 Environment::~Environment() {
   // need to make sure all the OrtAllocator instances are released prior to any plugin EPs being freed.
@@ -472,6 +521,21 @@ Status Environment::GetSharedAllocator(const OrtMemoryInfo& mem_info, OrtAllocat
   return Status::OK();
 }
 
+OrtKeyValuePairs Environment::GetConfigEntries() const {
+  std::shared_lock<std::shared_mutex> lock{config_entries_mutex_};
+  return config_entries_;  // copy
+}
+
+void Environment::InsertOrAssignConfigEntry(std::string key, std::string value) {
+  std::lock_guard<std::shared_mutex> lock{config_entries_mutex_};
+  config_entries_.Add(std::move(key), std::move(value));
+}
+
+void Environment::RemoveConfigEntry(const std::string& key) {
+  std::lock_guard<std::shared_mutex> lock{config_entries_mutex_};
+  config_entries_.Remove(key.c_str());
+}
+
 #if !defined(ORT_MINIMAL_BUILD)
 
 //
@@ -482,68 +546,169 @@ namespace {
 Status CreateDataTransferForFactory(OrtEpFactory& ep_factory,
                                     std::unique_ptr<plugin_ep::DataTransfer>& data_transfer) {
   OrtDataTransferImpl* data_transfer_impl = nullptr;
-  OrtStatus* status = ep_factory.CreateDataTransfer(&ep_factory, &data_transfer_impl);
-  if (status != nullptr) {
+  OrtStatus* ort_status = ep_factory.CreateDataTransfer(&ep_factory, &data_transfer_impl);
+  plugin_ep::OrtDataTransferImplUniquePtr owned_impl{data_transfer_impl};
+
+  if (ort_status != nullptr) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, EP_FAIL,
-                           "Error creating data transfer: ", ToStatusAndRelease(status).ToString());
+                           "Error creating data transfer: ", ToStatusAndRelease(ort_status).ToString());
   }
 
-  if (data_transfer_impl != nullptr) {
-    data_transfer = std::make_unique<plugin_ep::DataTransfer>(*data_transfer_impl);
+  if (owned_impl != nullptr) {
+    data_transfer = std::make_unique<plugin_ep::DataTransfer>(std::move(owned_impl));
   }
 
   return Status::OK();
+}
+
+bool AreVirtualDevicesAllowed(std::string_view lib_registration_name) {
+  constexpr std::string_view suffix{".virtual"};
+
+  return lib_registration_name.size() >= suffix.size() &&
+         lib_registration_name.compare(lib_registration_name.size() - suffix.size(),
+                                       suffix.size(), suffix) == 0;
 }
 }  // namespace
 
 Status Environment::RegisterExecutionProviderLibrary(const std::string& registration_name,
                                                      std::unique_ptr<EpLibrary> ep_library,
                                                      const std::vector<EpFactoryInternal*>& internal_factories) {
-  if (ep_libraries_.count(registration_name) > 0) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "library is already registered under ", registration_name);
-  }
+#if defined(_WIN32) || defined(ORT_USE_TELEMETRY)
+  const Env& env = Env::Default();
+
+#if defined(ORT_USE_TELEMETRY)
+  const TimePoint tp = std::chrono::high_resolution_clock::now();
+#endif
+
+  // Windows ETW needs these calls even without ORT_USE_TELEMETRY.
+  env.GetTelemetryProvider().LogRegisterEpLibraryStart(registration_name);
+#endif  // defined(_WIN32) || defined(ORT_USE_TELEMETRY)
 
   auto status = Status::OK();
 
   ORT_TRY {
-    // create the EpInfo which loads the library if required
-    std::unique_ptr<EpInfo> ep_info = nullptr;
-    ORT_RETURN_IF_ERROR(EpInfo::Create(std::move(ep_library), ep_info));
+    status = [&]() -> Status {
+      bool registration_succeeded = false;
 
-    // add the pointers to the OrtEpDevice instances to our global list
-    execution_devices_.reserve(execution_devices_.size() + ep_info->execution_devices.size());
-    for (const auto& ed : ep_info->execution_devices) {
-      execution_devices_.push_back(ed.get());
-
-      // add shared allocators so they're available without an inference session being required.
-      // we don't replace an existing allocator as we just need one to exist for the OrtMemoryInfo and we don't want
-      // to blow away any custom allocators previously added by the user.
-      if (ed->device_memory_info != nullptr) {
-        ORT_RETURN_IF_ERROR(CreateSharedAllocatorImpl(*ed, *ed->device_memory_info, OrtDeviceAllocator, nullptr,
-                                                      nullptr, /*replace_existing*/ false));
+      if (ep_libraries_.contains(registration_name)) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "EP library is already registered under ", registration_name);
       }
 
-      if (ed->host_accessible_memory_info != nullptr) {
-        ORT_RETURN_IF_ERROR(CreateSharedAllocatorImpl(*ed, *ed->host_accessible_memory_info, OrtDeviceAllocator,
-                                                      nullptr, nullptr, /*replace_existing*/ false));
+      std::unique_ptr<EpInfo> ep_info;
+      ORT_RETURN_IF_ERROR(EpInfo::Create(std::move(ep_library), ep_info, internal_factories));
+
+      // Register shared allocators
+      const size_t max_allocator_count = SafeInt<size_t>(ep_info->execution_devices.size()) * 2;
+      std::vector<const OrtMemoryInfo*> registered_allocator_memory_infos;
+      registered_allocator_memory_infos.reserve(max_allocator_count);
+
+      auto rollback_shared_allocator_registrations = gsl::finally([&]() {
+        if (registration_succeeded) {
+          return;
+        }
+        for (auto it = registered_allocator_memory_infos.rbegin(); it != registered_allocator_memory_infos.rend(); ++it) {
+          ORT_IGNORE_RETURN_VALUE(UnregisterAllocatorImpl(**it, /*error_if_not_found*/ false));
+        }
+      });
+
+      for (const auto& ed : ep_info->execution_devices) {
+        // Add shared allocators so they're available without an inference session being required. Do not replace an
+        // existing allocator: we only need one for the OrtMemoryInfo and must preserve user-provided allocators.
+        for (const OrtMemoryInfo* memory_info : {ed->device_memory_info, ed->host_accessible_memory_info}) {
+          if (memory_info == nullptr) {
+            continue;
+          }
+
+          OrtAllocator* registered_allocator = nullptr;
+          ORT_RETURN_IF_ERROR(CreateSharedAllocatorImpl(*ed, *memory_info, OrtDeviceAllocator, nullptr,
+                                                        &registered_allocator, /*replace_existing*/ false));
+          if (registered_allocator != nullptr) {
+            registered_allocator_memory_infos.push_back(memory_info);
+          }
+        }
       }
-    }
 
-    for (auto* factory : ep_info->factories) {
-      std::unique_ptr<plugin_ep::DataTransfer> data_transfer;
-      ORT_RETURN_IF_ERROR(CreateDataTransferForFactory(*factory, data_transfer));
+      // Register data transfers
+      std::vector<plugin_ep::DataTransfer*> registered_data_transfers;
+      registered_data_transfers.reserve(ep_info->factories.size());
+      ep_info->data_transfers.reserve(ep_info->factories.size());
 
-      if (data_transfer) {
-        ep_info->data_transfers.push_back(data_transfer.get());  // store so we can unregister in the unload
-        ORT_RETURN_IF_ERROR(data_transfer_mgr_.RegisterDataTransfer(std::move(data_transfer)));
+      auto rollback_data_transfer_registrations = gsl::finally([&]() {
+        if (registration_succeeded) {
+          return;
+        }
+
+        for (auto it = registered_data_transfers.rbegin(); it != registered_data_transfers.rend(); ++it) {
+          ORT_IGNORE_RETURN_VALUE(data_transfer_mgr_.UnregisterDataTransfer(*it));
+        }
+      });
+
+      for (auto* factory : ep_info->factories) {
+        std::unique_ptr<plugin_ep::DataTransfer> data_transfer;
+        ORT_RETURN_IF_ERROR(CreateDataTransferForFactory(*factory, data_transfer));
+
+        if (data_transfer) {
+          auto* data_transfer_ptr = data_transfer.get();
+          ORT_RETURN_IF_ERROR(data_transfer_mgr_.RegisterDataTransfer(std::move(data_transfer)));
+          registered_data_transfers.push_back(data_transfer_ptr);
+          ep_info->data_transfers.push_back(data_transfer_ptr);
+        }
       }
-    }
 
-    for (const auto& internal_factory : internal_factories) {
-      internal_ep_factories_.insert(internal_factory);
-    }
+      // Register internal factories
+      std::vector<EpFactoryInternal*> registered_internal_factories;
+      registered_internal_factories.reserve(internal_factories.size());
 
-    ep_libraries_[registration_name] = std::move(ep_info);
+      auto rollback_internal_factory_registration = gsl::finally([&]() {
+        if (registration_succeeded) {
+          return;
+        }
+
+        for (auto it = registered_internal_factories.rbegin(); it != registered_internal_factories.rend(); ++it) {
+          internal_ep_factories_.erase(*it);
+        }
+      });
+
+      for (auto* internal_factory : internal_factories) {
+        if (internal_ep_factories_.insert(internal_factory).second) {
+          registered_internal_factories.push_back(internal_factory);
+        }
+      }
+
+      // Register EP devices
+      auto rollback_execution_devices_registration = gsl::finally(
+          [&, original_size = execution_devices_.size()]() {
+            if (registration_succeeded) {
+              return;
+            }
+
+            execution_devices_.erase(execution_devices_.begin() + original_size,
+                                     execution_devices_.end());
+          });
+
+      execution_devices_.reserve(SafeInt<size_t>(execution_devices_.size()) +
+                                 ep_info->execution_devices.size());
+      std::transform(ep_info->execution_devices.begin(), ep_info->execution_devices.end(),
+                     std::back_inserter(execution_devices_),
+                     [](const std::unique_ptr<OrtEpDevice>& ep_device) {
+                       return ep_device.get();
+                     });
+
+      // Finally, register the EP library
+
+      // Notes:
+      // `ep_info`'s target must stay alive for any rollback logic that may need to run.
+      // Directly moving into `ep_libraries_.emplace()` could cause it to be prematurely destroyed if emplace throws
+      // after ownership has transferred from `ep_info`. This is why we first emplace an empty unique_ptr and then
+      // swap into it.
+      //
+      // We ignore `emplace_result.second` since we already checked for an existing entry in `ep_libraries_` above.
+      const auto emplace_result = ep_libraries_.emplace(registration_name, nullptr);
+      emplace_result.first->second.swap(ep_info);
+
+      registration_succeeded = true;
+      return Status::OK();
+    }();
   }
   ORT_CATCH(const std::exception& ex) {
     ORT_HANDLE_EXCEPTION([&]() {
@@ -551,12 +716,28 @@ Status Environment::RegisterExecutionProviderLibrary(const std::string& registra
                                "Failed to register EP library under '", registration_name, "' with error: ", ex.what());
     });
   }
+  ORT_CATCH(...) {
+    ORT_HANDLE_EXCEPTION([&]() {
+      status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
+                               "Failed to register EP library under '", registration_name, "' with unknown exception.");
+    });
+  }
 
+#if defined(ORT_USE_TELEMETRY)
+  env.GetTelemetryProvider().LogRegisterEpLibraryEnd(registration_name, status, TimeDiffMicroSeconds(tp));
+#elif defined(_WIN32)
+  env.GetTelemetryProvider().LogRegisterEpLibraryEnd(registration_name, status, 0);
+#endif
   return status;
 }
 
 Status Environment::CreateAndRegisterInternalEps() {
-  auto internal_ep_libraries = EpLibraryInternal::CreateInternalEps();
+  // Capture allow_virtual_devices here (lock-free) and pass it to the internal EP factories at
+  // construction. The internal WebGPU EP factory needs it in GetSupportedDevices but cannot query the
+  // OrtEnv singleton there: internal EPs are registered from Environment::Create, before OrtEnv
+  // publishes p_instance_, so there is no instance to find.
+  const bool allow_virtual_devices = num_allow_virtual_device_uses_ > 0;
+  auto internal_ep_libraries = EpLibraryInternal::CreateInternalEps(allow_virtual_devices);
   for (auto& ep_library : internal_ep_libraries) {
     // we do a std::move in the function call so need a valid pointer for the args after the move
     auto* internal_library_ptr = ep_library.get();
@@ -568,33 +749,75 @@ Status Environment::CreateAndRegisterInternalEps() {
   return Status::OK();
 }
 
+Status Environment::CreateAndRegisterStaticPluginEps(StaticPluginEpRegistrationToken) {
+  // Intentionally does not take mutex_ and calls the private, non-locking RegisterExecutionProviderLibrary overload.
+  // This is safe because the caller holds the OrtEnv creation mutex, so no other thread can obtain a reference to this
+  // Environment yet. Taking mutex_ here would deadlock if a plugin EP called a locking Environment API from
+  // OrtEpFactory::GetSupportedDevices.
+  auto static_plugin_ep_libraries = CreateStaticPluginEpLibraries();
+  for (auto& ep_library : static_plugin_ep_libraries) {
+    const std::string registration_name = ep_library->RegistrationName();
+    ORT_RETURN_IF_ERROR(RegisterExecutionProviderLibrary(registration_name, std::move(ep_library)));
+  }
+
+  return Status::OK();
+}
+
 Status Environment::RegisterExecutionProviderLibrary(const std::string& registration_name, const ORTCHAR_T* lib_path) {
   std::lock_guard<std::mutex> lock{mutex_};
 
-  std::vector<EpFactoryInternal*> internal_factories = {};
+#if defined(_WIN32) || defined(ORT_USE_TELEMETRY)
+  std::string lib_file_name = PathToUTF8String(std::filesystem::path(lib_path).filename().native());
+  Env::Default().GetTelemetryProvider().LogRegisterEpLibraryWithLibPath(registration_name, lib_file_name);
+#endif
+
+  std::vector<EpFactoryInternal*> internal_factories;
   std::unique_ptr<EpLibrary> ep_library;
 
+  // An application can allow EP libraries to create virtual devices by using an EP library registration name that
+  // ends in the suffix ".virtual". If so, ORT automatically sets the config key "allow_virtual_devices" to "1"
+  // in the environment. We track the number of libraries that use virtual devices to be able to remove
+  // "allow_virtual_devices" from the config entries when the last library is unregistered. In practice,
+  // we expect only one such library to be registered for cross-compilation.
+  if (AreVirtualDevicesAllowed(registration_name)) {
+    if (num_allow_virtual_device_uses_ == 0) {
+      InsertOrAssignConfigEntry(kOrtEnvAllowVirtualDevices, "1");
+    }
+
+    num_allow_virtual_device_uses_ += 1;
+  }
+
   // This will create an EpLibraryPlugin or an EpLibraryProviderBridge depending on what the library supports.
-  ORT_RETURN_IF_ERROR(LoadPluginOrProviderBridge(registration_name, lib_path, ep_library,
-                                                 internal_factories));
+  ORT_RETURN_IF_ERROR(LoadPluginOrProviderBridge(registration_name, lib_path, ep_library, internal_factories));
 
   return RegisterExecutionProviderLibrary(registration_name, std::move(ep_library), internal_factories);
 }
 
-Status Environment::UnregisterExecutionProviderLibrary(const std::string& ep_name) {
+Status Environment::UnregisterExecutionProviderLibrary(const std::string& registration_name) {
   std::lock_guard<std::mutex> lock{mutex_};
 
-  if (ep_libraries_.count(ep_name) == 0) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Execution provider library: ", ep_name, " was not registered.");
+  if (ep_libraries_.count(registration_name) == 0) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Execution provider library: ", registration_name,
+                           " was not registered.");
   }
 
   auto status = Status::OK();
 
   ORT_TRY {
-    auto ep_info = std::move(ep_libraries_[ep_name]);
+    auto ep_info = std::move(ep_libraries_[registration_name]);
+
+    // Clean up environment config entry that may have been added to enable virtual devices.
+    if (AreVirtualDevicesAllowed(registration_name)) {
+      num_allow_virtual_device_uses_ -= 1;
+
+      if (num_allow_virtual_device_uses_ == 0) {
+        RemoveConfigEntry(kOrtEnvAllowVirtualDevices);
+      }
+    }
+
     // remove from map and global list of OrtEpDevice* before unloading so we don't get a leftover entry if
     // something goes wrong in any of the following steps..
-    ep_libraries_.erase(ep_name);
+    ep_libraries_.erase(registration_name);
 
     for (auto* data_transfer : ep_info->data_transfers) {
       ORT_RETURN_IF_ERROR(data_transfer_mgr_.UnregisterDataTransfer(data_transfer));
@@ -627,12 +850,89 @@ Status Environment::UnregisterExecutionProviderLibrary(const std::string& ep_nam
   }
   ORT_CATCH(const std::exception& ex) {
     ORT_HANDLE_EXCEPTION([&]() {
-      status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to unregister EP library: ", ep_name, " with error: ",
-                               ex.what());
+      status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to unregister EP library: ", registration_name,
+                               " with error: ", ex.what());
     });
   }
 
   return status;
+}
+
+Status Environment::GetHardwareDeviceEpIncompatibilityDetails(
+    const std::string& ep_name,
+    const OrtHardwareDevice* hw,
+    std::unique_ptr<OrtDeviceEpIncompatibilityDetails>& details) const {
+  std::lock_guard<std::mutex> lock{mutex_};
+
+  OrtEpFactory* matched_factory = nullptr;
+
+  // Search for a factory whose GetName() matches ep_name exactly.
+  for (const auto& [registration_name, ep_info] : ep_libraries_) {
+    for (OrtEpFactory* factory : ep_info->factories) {
+      if (factory != nullptr && factory->GetName != nullptr) {
+        const char* factory_name = factory->GetName(factory);
+        if (factory_name != nullptr && ep_name == factory_name) {
+          matched_factory = factory;
+          break;
+        }
+      }
+    }
+    if (matched_factory != nullptr) {
+      break;
+    }
+  }
+
+  if (matched_factory == nullptr) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
+                           "No valid factory found for execution provider '", ep_name, "'.");
+  }
+
+  // ORT creates the details object with default values (compatible)
+  details = std::make_unique<OrtDeviceEpIncompatibilityDetails>();
+  // If the factory implements GetHardwareDeviceIncompatibilityDetails, let it initialize the details
+  if (matched_factory->GetHardwareDeviceIncompatibilityDetails != nullptr) {
+    OrtStatusPtr status = matched_factory->GetHardwareDeviceIncompatibilityDetails(matched_factory, hw, details.get());
+
+    if (status != nullptr) {
+      return ToStatusAndRelease(status);
+    }
+  }
+
+  // Factory doesn't implement the hook - details remain with default values (compatible)
+  return Status::OK();
+}
+
+namespace {
+std::vector<const OrtHardwareDevice*> SortDevicesByType() {
+  auto& devices = DeviceDiscovery::GetDevices();
+  std::vector<const OrtHardwareDevice*> sorted_devices;
+  sorted_devices.reserve(devices.size());
+
+  const auto select_by_type = [&](OrtHardwareDeviceType type) {
+    for (const auto& device : devices) {
+      if (device.type == type) {
+        sorted_devices.push_back(&device);
+      }
+    }
+  };
+
+  select_by_type(OrtHardwareDeviceType_NPU);
+  select_by_type(OrtHardwareDeviceType_GPU);
+  select_by_type(OrtHardwareDeviceType_CPU);
+
+  return sorted_devices;
+}
+
+// Returns a static reference to sorted hardware devices.
+// Hardware devices are discovered once at startup and don't change.
+const std::vector<const OrtHardwareDevice*>& GetSortedHardwareDevices() {
+  static const auto sorted_devices = SortDevicesByType();
+  return sorted_devices;
+}
+}  // namespace
+
+const std::vector<const OrtHardwareDevice*>& Environment::GetSortedOrtHardwareDevices() const {
+  return GetSortedHardwareDevices();
 }
 
 Status Environment::CreateSharedAllocator(const OrtEpDevice& ep_device,
@@ -665,50 +965,52 @@ Status Environment::CreateSharedAllocatorImpl(const OrtEpDevice& ep_device,
                            "any arena options via the allocator options.");
   }
 
-  // we need to remove from shared_ort_allocators_ first in case the entry in shared_allocators_ owns the pointer in
-  // shared_ort_allocators_.
-  if (auto it = FindExistingAllocator(shared_ort_allocators_, memory_info, /*match_name*/ true);
-      it != shared_ort_allocators_.end()) {
-    shared_ort_allocators_.erase(it);
-  }
-
   // we only want one shared allocator for an OrtDevice in the shared_allocators_ so that it's deterministic which
   // one will be used for an inference session. ignore the name so that is the case.
-  if (auto it = FindExistingAllocator(shared_allocators_, memory_info, /*match_name*/ false);
-      it != shared_allocators_.end()) {
-    if (!replace_existing) {
-      return Status::OK();
+  auto existing_ort_allocator =
+      FindExistingAllocator(shared_ort_allocators_, memory_info, /*match_name*/ true);
+
+  auto existing_shared_allocator =
+      FindExistingAllocator(shared_allocators_, memory_info, /*match_name*/ false);
+
+  if (!replace_existing &&
+      (existing_ort_allocator != shared_ort_allocators_.end() ||
+       existing_shared_allocator != shared_allocators_.end())) {
+    if (allocator_out != nullptr) {
+      *allocator_out = nullptr;
     }
 
-    shared_allocators_.erase(it);
+    LOGS_DEFAULT(INFO) << "A shared allocator is already registered for " << memory_info
+                       << ". Skipping EP allocator creation.";
+    return Status::OK();
   }
 
-  OrtAllocator* allocator = nullptr;
-  auto* ort_status = ep_device.ep_factory->CreateAllocator(ep_device.ep_factory, &memory_info, allocator_options,
-                                                           &allocator);
-  if (ort_status != nullptr) {
-    return ToStatusAndRelease(ort_status);
+  // we need to remove from shared_ort_allocators_ first in case the entry in shared_allocators_ owns the pointer in
+  // shared_ort_allocators_.
+  if (existing_ort_allocator != shared_ort_allocators_.end()) {
+    shared_ort_allocators_.erase(existing_ort_allocator);
   }
 
-  if (allocator->Info(allocator)->alloc_type == OrtAllocatorType::OrtArenaAllocator) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
-                           "OrtEpFactory returned an allocator with OrtAllocatorType of OrtArenaAllocator. "
-                           "This type is reserved for ONNX Runtime internal usage only, as any arena usage by the "
-                           "EP library should be opaque to ORT");
+  if (existing_shared_allocator != shared_allocators_.end()) {
+    shared_allocators_.erase(existing_shared_allocator);
   }
 
-  auto ort_allocator = OrtAllocatorUniquePtr(allocator,
-                                             [&ep_device](OrtAllocator* allocator) {
-                                               ep_device.ep_factory->ReleaseAllocator(ep_device.ep_factory, allocator);
-                                             });
+  // Create a new allocator.
 
-  shared_ort_allocators_.insert(allocator);
+  auto* ep_factory = ep_device.ep_factory;
+  OrtAllocator* raw_ort_allocator = nullptr;
+  AllocatorPtr shared_allocator;
+  ORT_RETURN_IF_ERROR(ep_allocator_utils::CreateAndWrapEpAllocator(*ep_factory, memory_info, allocator_options,
+                                                                   shared_allocator, &raw_ort_allocator));
+  ORT_RETURN_IF_NOT(raw_ort_allocator != nullptr, "OrtEpFactory returned a null allocator.");
 
-  AllocatorPtr shared_allocator = std::make_shared<IAllocatorImplWrappingOrtAllocator>(std::move(ort_allocator));
+  shared_allocators_.reserve(SafeInt<size_t>(shared_allocators_.size()) + 1);
+  const auto [_, inserted] = shared_ort_allocators_.insert(raw_ort_allocator);
+  ORT_RETURN_IF_NOT(inserted, "OrtEpFactory returned an allocator that is already registered.");
   shared_allocators_.push_back(std::move(shared_allocator));
 
   if (allocator_out != nullptr) {
-    *allocator_out = allocator;
+    *allocator_out = raw_ort_allocator;
   }
 
   return Status::OK();
@@ -726,45 +1028,26 @@ Status Environment::ReleaseSharedAllocator(const OrtEpDevice& ep_device, OrtDevi
   return status;
 }
 
-namespace {
-std::vector<const OrtHardwareDevice*> SortDevicesByType() {
-  auto& devices = DeviceDiscovery::GetDevices();
-  std::vector<const OrtHardwareDevice*> sorted_devices;
-  sorted_devices.reserve(devices.size());
-
-  const auto select_by_type = [&](OrtHardwareDeviceType type) {
-    for (const auto& device : devices) {
-      if (device.type == type) {
-        sorted_devices.push_back(&device);
-      }
-    }
-  };
-
-  select_by_type(OrtHardwareDeviceType_NPU);
-  select_by_type(OrtHardwareDeviceType_GPU);
-  select_by_type(OrtHardwareDeviceType_CPU);
-
-  return sorted_devices;
-}
-}  // namespace
-
 Status Environment::EpInfo::Create(std::unique_ptr<EpLibrary> library_in, std::unique_ptr<EpInfo>& out,
                                    const std::vector<EpFactoryInternal*>& internal_factories) {
   if (!library_in) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "EpLibrary was null");
   }
 
-  out.reset(new EpInfo());  // can't use make_unique with private ctor
-  EpInfo& instance = *out;
+  auto instance_unique_ptr = std::unique_ptr<EpInfo>(new EpInfo());  // can't use make_unique with private ctor
+  EpInfo& instance = *instance_unique_ptr;
   instance.library = std::move(library_in);
   instance.internal_factories = internal_factories;
 
   ORT_RETURN_IF_ERROR(instance.library->Load());
-  instance.factories = instance.library->GetFactories();
 
-  // OrtHardwareDevice instances to pass to GetSupportedDevices. sorted by type to be slightly more structured.
-  // the set of hardware devices is static so this can also be static.
-  const static std::vector<const OrtHardwareDevice*> sorted_devices = SortDevicesByType();
+  {
+    auto factories = instance.library->GetFactories();
+    instance.factories.assign(factories.begin(), factories.end());
+  }
+
+  // OrtHardwareDevice instances to pass to GetSupportedDevices.
+  const auto& sorted_devices = GetSortedHardwareDevices();
 
   for (auto* factory_ptr : instance.factories) {
     ORT_ENFORCE(factory_ptr != nullptr, "Factory pointer was null. EpLibrary should prevent this. Library:",
@@ -778,13 +1061,21 @@ Status Environment::EpInfo::Create(std::unique_ptr<EpLibrary> library_in, std::u
         factory.GetSupportedDevices(&factory, sorted_devices.data(), sorted_devices.size(),
                                     ep_devices.data(), ep_devices.size(), &num_ep_devices)));
 
+    const auto* library_path = instance.library->LibraryPath();
     for (size_t i = 0; i < num_ep_devices; ++i) {
-      if (ep_devices[i] != nullptr) {                            // should never happen but just in case...
+      if (ep_devices[i] != nullptr) {  // should never happen but just in case...
+        if (library_path != nullptr) {
+          // Add library path to EP metadata if available.
+          // This is used by GenAI for custom library loading so we want to consistently set it.
+          ep_devices[i]->ep_metadata.Add(kOrtEpDevice_EpMetadataKey_LibraryPath, library_path->string());
+        }
+
         instance.execution_devices.emplace_back(ep_devices[i]);  // take ownership
       }
     }
   }
 
+  out = std::move(instance_unique_ptr);
   return Status::OK();
 }
 

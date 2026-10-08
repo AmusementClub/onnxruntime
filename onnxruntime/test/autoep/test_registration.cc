@@ -1,28 +1,101 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-// registration/selection is only supported on windows as there's no device discovery on other platforms
-#ifdef _WIN32
-
 #include <filesystem>
+#include <gsl/gsl>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "core/framework/data_types.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "core/session/onnxruntime_ep_device_ep_metadata_keys.h"
+#include "core/session/onnxruntime_env_config_keys.h"
+
+// Exercise the header-only adapters without changing the host test's EP build mode.
+#pragma push_macro("EP_ENFORCE")
+#undef EP_ENFORCE
+#define EP_ENFORCE ORT_ENFORCE
+#pragma push_macro("ORT_EP_API_ADAPTER_HEADER_INCLUDED")
+#undef ORT_EP_API_ADAPTER_HEADER_INCLUDED
+#define ORT_EP_API_ADAPTER_HEADER_INCLUDED
+#include "ep/adapter/kernel_def_builder.h"
+#include "ep/adapter/tensor_helper.h"
+#pragma pop_macro("ORT_EP_API_ADAPTER_HEADER_INCLUDED")
+#pragma pop_macro("EP_ENFORCE")
 
 #include "test/autoep/test_autoep_utils.h"
 #include "test/util/include/api_asserts.h"
 #include "test/util/include/asserts.h"
 
 extern std::unique_ptr<Ort::Env> ort_env;
+extern "C" void ortenv_setup();
+extern "C" void ortenv_teardown();
 
 namespace onnxruntime {
 namespace test {
 
+TEST(OrtEpLibrary, GetTensorDataTypeUsesOrtElementTypes) {
+  const auto& ep_api = Ort::GetEpApi();
+  const struct {
+    ONNXTensorElementDataType ort_type;
+    int proto_type;
+    size_t storage_bytes;
+  } types[] = {
+      {ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, ONNX_NAMESPACE::TensorProto_DataType_FLOAT, 20},
+      {ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2, ONNX_NAMESPACE::TensorProto_DataType_UINT2, 2},
+      {ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2, ONNX_NAMESPACE::TensorProto_DataType_INT2, 2},
+#if !defined(DISABLE_FLOAT4_TYPES)
+      {ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1, ONNX_NAMESPACE::TensorProto_DataType_FLOAT4E2M1, 3},
+#endif
+#if !defined(DISABLE_FLOAT8_TYPES)
+      {ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0, ONNX_NAMESPACE::TensorProto_DataType_FLOAT8E8M0, 5},
+#endif
+  };
+  Ort::AllocatorWithDefaultOptions allocator;
+  const int64_t shape[] = {5};
+  for (const auto& [ort_type, proto_type, storage_bytes] : types) {
+    SCOPED_TRACE(ort_type);
+    const OrtDataType* data_type = nullptr;
+    ASSERT_ORTSTATUS_OK(ep_api.GetTensorDataType(ort_type, &data_type));
+    ASSERT_NE(data_type, nullptr);
+    const auto* ml_type = reinterpret_cast<const DataTypeImpl*>(data_type);
+    const auto* type_proto = ml_type->GetTypeProto();
+    ASSERT_NE(type_proto, nullptr);
+    EXPECT_EQ(type_proto->tensor_type().elem_type(), proto_type);
+    const auto* tensor_type = ml_type->AsTensorType();
+    ASSERT_NE(tensor_type, nullptr);
+    const auto* primitive_type = tensor_type->GetElementType()->AsPrimitiveDataType();
+    ASSERT_NE(primitive_type, nullptr);
+    EXPECT_EQ(primitive_type->GetDataType(), proto_type);
+    EXPECT_EQ(ep::adapter::MLDataTypeToOrtDataType(ml_type), data_type);
+    EXPECT_EQ(ep::adapter::TryMLDataTypeToOrtDataType(ml_type), data_type);
+
+    auto value = Ort::Value::CreateTensor(allocator, shape, 1, ort_type);
+    auto tensor = ep::adapter::CreateTensorFromApiValue(value);
+    EXPECT_EQ(tensor.DataType()->AsPrimitiveDataType()->GetDataType(), proto_type);
+    EXPECT_EQ(tensor.SizeInBytes(), storage_bytes);
+    EXPECT_EQ(tensor.DataRaw(), value.GetTensorRawData());
+  }
+#if defined(DISABLE_FLOAT8_TYPES)
+  const OrtDataType* data_type = nullptr;
+  Ort::Status status(ep_api.GetTensorDataType(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E8M0, &data_type));
+  EXPECT_FALSE(status.IsOK());
+  EXPECT_EQ(status.GetErrorCode(), ORT_NOT_IMPLEMENTED);
+  EXPECT_EQ(data_type, nullptr);
+#endif
+}
+
+TEST(OrtEpLibrary, RegisterMissingPluginLibrary) {
+  const auto missing_path = Utils::example_ep_info.library_path.parent_path() / "missing_ep_library";
+  Ort::Status status{Ort::GetApi().RegisterExecutionProviderLibrary(*ort_env, "missing_ep_library",
+                                                                    missing_path.c_str())};
+  ASSERT_FALSE(status.IsOK());
+}
+
 TEST(OrtEpLibrary, LoadUnloadPluginLibrary) {
   const std::filesystem::path& library_path = Utils::example_ep_info.library_path;
   const std::string& registration_name = Utils::example_ep_info.registration_name;
+  const std::string& ep_name = Utils::example_ep_info.ep_name;
 
   const OrtApi* c_api = &Ort::GetApi();
   // this should load the library and create OrtEpDevice
@@ -35,10 +108,8 @@ TEST(OrtEpLibrary, LoadUnloadPluginLibrary) {
   ASSERT_ORTSTATUS_OK(Ort::GetApi().GetEpDevices(*ort_env, &ep_devices, &num_devices));
   // should be one device for the example EP
   auto num_test_ep_devices = std::count_if(ep_devices, ep_devices + num_devices,
-                                           [&registration_name, &c_api](const OrtEpDevice* device) {
-                                             // the example uses the registration name for the EP name
-                                             // but that is not a requirement and the two can differ.
-                                             return c_api->EpDevice_EpName(device) == registration_name;
+                                           [&](const OrtEpDevice* device) {
+                                             return c_api->EpDevice_EpName(device) == ep_name;
                                            });
   ASSERT_EQ(num_test_ep_devices, 1) << "Expected an OrtEpDevice to have been created by the test library.";
 
@@ -50,6 +121,7 @@ TEST(OrtEpLibrary, LoadUnloadPluginLibrary) {
 TEST(OrtEpLibrary, LoadUnloadPluginLibraryCxxApi) {
   const std::filesystem::path& library_path = Utils::example_ep_info.library_path;
   const std::string& registration_name = Utils::example_ep_info.registration_name;
+  const std::string& ep_name = Utils::example_ep_info.ep_name;
 
   // this should load the library and create OrtEpDevice
   ort_env->RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
@@ -58,22 +130,38 @@ TEST(OrtEpLibrary, LoadUnloadPluginLibraryCxxApi) {
 
   // should be one device for the example EP
   auto test_ep_device = std::find_if(ep_devices.begin(), ep_devices.end(),
-                                     [&registration_name](Ort::ConstEpDevice& device) {
-                                       // the example uses the registration name for the EP name
-                                       // but that is not a requirement and the two can differ.
-                                       return device.EpName() == registration_name;
+                                     [&](Ort::ConstEpDevice& device) {
+                                       return device.EpName() == ep_name;
                                      });
   ASSERT_NE(test_ep_device, ep_devices.end()) << "Expected an OrtEpDevice to have been created by the test library.";
 
-  // test all the C++ getters. expected values are from \onnxruntime\test\autoep\library\example_plugin_ep.cc
+  // test all the C++ getters.
+  // expected values are from \onnxruntime\test\autoep\library\example_plugin_ep\*.cc
   ASSERT_STREQ(test_ep_device->EpVendor(), "Contoso");
 
   auto metadata = test_ep_device->EpMetadata();
   ASSERT_STREQ(metadata.GetValue(kOrtEpDevice_EpMetadataKey_Version), "0.1.0");
   ASSERT_STREQ(metadata.GetValue("supported_devices"), "CrackGriffin 7+");
+  // Verify the example plugin's expected os_driver_version value.
+  ASSERT_STREQ(metadata.GetValue(kOrtEpDevice_EpMetadataKey_OSDriverVersion), "31.0.101.1000");
+  // Verify the example plugin's advertised GroupQueryAttention Value cache layout preference. It is
+  // "BNSH" because the example EP does not fuse the Transpose -> GQA -> Transpose sequence; only an
+  // EP that does should report "BNHS".
+  ASSERT_STREQ(metadata.GetValue(kOrtEpDevice_EpMetadataKey_GqaPreferredValueLayout), "BNSH");
+  // Verify the example plugin reports weightless support for all initializers.
+  ASSERT_STREQ(metadata.GetValue(kOrtEpDevice_EpMetadataKey_WeightlessSupport), "all");
 
   auto options = test_ep_device->EpOptions();
   ASSERT_STREQ(options.GetValue("run_really_fast"), "true");
+
+  // Verify the library path is present in the EP metadata
+  const char* metadata_library_path = metadata.GetValue(kOrtEpDevice_EpMetadataKey_LibraryPath);
+  ASSERT_NE(metadata_library_path, nullptr) << "Expected library_path to be present in EP metadata.";
+
+  // Verify the library path matches the registered path
+  std::filesystem::path metadata_path{metadata_library_path};
+  ASSERT_EQ(std::filesystem::canonical(metadata_path), std::filesystem::canonical(library_path))
+      << "Expected library_path in EP metadata to match the registered library path.";
 
   // the CPU device info will vary by machine so check for the lowest common denominator values
   Ort::ConstHardwareDevice device = test_ep_device->Device();
@@ -83,13 +171,161 @@ TEST(OrtEpLibrary, LoadUnloadPluginLibraryCxxApi) {
   ASSERT_NE(device.Vendor(), nullptr);
   Ort::ConstKeyValuePairs device_metadata = device.Metadata();
   std::unordered_map<std::string, std::string> metadata_entries = device_metadata.GetKeyValuePairs();
+#if defined(_WIN32)
   ASSERT_GT(metadata_entries.size(), 0);  // should have at least SPDRP_HARDWAREID on Windows
+#endif
 
   // and this should unload it without throwing
   ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
 }
 
+TEST(OrtEpLibrary, FailedRegistrationLeavesEnvironmentUnchanged) {
+  const std::filesystem::path& library_path = Utils::example_ep_info.library_path;
+  const std::string& registration_name = Utils::example_ep_info.registration_name;
+  const size_t initial_device_count = ort_env->GetEpDevices().size();
+
+  Utils::LoadExampleEpHooksPtr hooks;
+  ASSERT_NO_FATAL_FAILURE(Utils::LoadExampleEpHooks(Utils::example_ep_info, hooks));
+  ASSERT_NE(hooks->set_create_data_transfer_failure, nullptr);
+
+  {
+    // Fail registration with a data transfer creation failure.
+    hooks->set_create_data_transfer_failure(1);
+    auto reset_failure = gsl::finally([&] { hooks->set_create_data_transfer_failure(0); });
+
+    Ort::Status status{Ort::GetApi().RegisterExecutionProviderLibrary(
+        *ort_env, registration_name.c_str(), library_path.c_str())};
+    ASSERT_FALSE(status.IsOK());
+
+    // The failed library must not contribute any EP devices to the environment.
+    EXPECT_EQ(ort_env->GetEpDevices().size(), initial_device_count);
+  }
+
+  // The same registration name must remain available after the failed attempt.
+  ort_env->RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
+  EXPECT_EQ(ort_env->GetEpDevices().size(), initial_device_count + 1);
+  ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
+
+  // The successful registration must still support a normal unregister lifecycle.
+  EXPECT_EQ(ort_env->GetEpDevices().size(), initial_device_count);
+}
+
+// Test loading example_plugin_ep_virt_gpu and its associated OrtEpDevice/OrtHardwareDevice.
+// This EP creates a new OrtHardwareDevice instance that represents a virtual GPU and gives to ORT.
+TEST(OrtEpLibrary, LoadUnloadPluginVirtGpuLibraryCxxApi) {
+  const std::filesystem::path& library_path = Utils::example_ep_virt_gpu_info.library_path;
+  const std::string& registration_name = "example_plugin_ep_virt_gpu";
+  const std::string& ep_name = Utils::example_ep_virt_gpu_info.ep_name;
+
+  auto get_plugin_ep_devices = [&](Ort::Env& env) -> std::vector<Ort::ConstEpDevice> {
+    std::vector<Ort::ConstEpDevice> all_ep_devices = env.GetEpDevices();
+    std::vector<Ort::ConstEpDevice> ep_devices;
+
+    std::copy_if(all_ep_devices.begin(), all_ep_devices.end(), std::back_inserter(ep_devices),
+                 [&](Ort::ConstEpDevice& device) {
+                   return device.EpName() == ep_name;
+                 });
+
+    return ep_devices;
+  };
+
+  auto is_hw_device_virtual = [](Ort::ConstHardwareDevice hw_device) -> bool {
+    std::unordered_map<std::string, std::string> metadata_entries = hw_device.Metadata().GetKeyValuePairs();
+    auto iter = metadata_entries.find(kOrtHardwareDevice_MetadataKey_IsVirtual);
+
+    if (iter == metadata_entries.end()) {
+      return false;
+    }
+
+    return iter->second == "1";
+  };
+
+  // Test getting EP's supported OrtEpDevices. Do not allow virtual devices.
+  // The EP should not return any OrtEpDevice instances.
+  {
+    ort_env->RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
+
+    // Find ep devices for this EP. Should not get any.
+    std::vector<Ort::ConstEpDevice> ep_devices = get_plugin_ep_devices(*ort_env);
+    ASSERT_EQ(ep_devices.size(), 0);
+
+    ort_env->UnregisterExecutionProviderLibrary(registration_name.c_str());
+  }
+
+  // Test getting EP's supported OrtEpDevices, but ALLOW virtual devices.
+  // The EP should return a OrtEpDevice for a virtual GPU.
+  {
+    // Use a registration name ending with ".virtual" to indicate to the EP library (factory) that creating virtual
+    // devices is allowed.
+    std::string registration_name_for_virtual_devices = registration_name + ".virtual";
+    ort_env->RegisterExecutionProviderLibrary(registration_name_for_virtual_devices.c_str(), library_path.c_str());
+
+    // Find ep devices for this EP. Should get a virtual gpu.
+    std::vector<Ort::ConstEpDevice> ep_devices = get_plugin_ep_devices(*ort_env);
+    ASSERT_EQ(ep_devices.size(), 1);
+
+    auto virt_gpu_ep_device = std::find_if(ep_devices.begin(), ep_devices.end(),
+                                           [](Ort::ConstEpDevice& ep_device) {
+                                             return ep_device.Device().Type() == OrtHardwareDeviceType_GPU;
+                                           });
+
+    ASSERT_TRUE(is_hw_device_virtual(virt_gpu_ep_device->Device()));
+
+    // test metadata and provider options attached to the virtual OrtEpDevice.
+    // expected values are from \onnxruntime\test\autoep\library\example_plugin_ep_virt_gpu\*.cc
+    ASSERT_STREQ(virt_gpu_ep_device->EpVendor(), "Contoso2");
+
+    auto metadata = virt_gpu_ep_device->EpMetadata();
+    ASSERT_STREQ(metadata.GetValue(kOrtEpDevice_EpMetadataKey_Version), "0.1.0");
+    ASSERT_STREQ(metadata.GetValue("some_metadata"), "1");
+
+    auto options = virt_gpu_ep_device->EpOptions();
+    ASSERT_STREQ(options.GetValue("compile_optimization"), "O3");
+
+    // Check the virtual GPU hw device info.
+    ASSERT_EQ(virt_gpu_ep_device->Device().VendorId(), 0xB358);
+    ASSERT_EQ(virt_gpu_ep_device->Device().DeviceId(), 0);
+    ASSERT_STREQ(virt_gpu_ep_device->Device().Vendor(), virt_gpu_ep_device->EpVendor());
+
+    ort_env->UnregisterExecutionProviderLibrary(registration_name_for_virtual_devices.c_str());
+  }
+
+  // Test using OrtApi::CreateEnvWithOptions to explicitly set a config that enables virtual devices.
+  // The EP should return a OrtEpDevice for a virtual GPU.
+
+  ortenv_teardown();  // Release current OrtEnv as we need to recreate it.
+
+  auto run_test = [&]() -> void {
+    // Create OrtEnv with config entry to enable virtual devices.
+    Ort::KeyValuePairs env_configs;
+    env_configs.Add(kOrtEnvAllowVirtualDevices, "1");
+
+    OrtEnvCreationOptions env_options{};
+    env_options.version = ORT_API_VERSION;
+    env_options.logging_severity_level = OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO;
+    env_options.log_id = "LoadUnloadPluginVirtGpuLibraryCxxApi";
+    env_options.config_entries = env_configs.GetConst();
+
+    Ort::Env tmp_env(&env_options);
+
+    // Register EP library. It should be able to extract the env config entry that enables virtual devices.
+    tmp_env.RegisterExecutionProviderLibrary(registration_name.c_str(), library_path.c_str());
+
+    // Find ep devices for this EP. Should get a virtual gpu.
+    std::vector<Ort::ConstEpDevice> ep_devices = get_plugin_ep_devices(tmp_env);
+    ASSERT_EQ(ep_devices.size(), 1);
+
+    auto virt_gpu_ep_device = std::find_if(ep_devices.begin(), ep_devices.end(),
+                                           [](Ort::ConstEpDevice& ep_device) {
+                                             return ep_device.Device().Type() == OrtHardwareDeviceType_GPU;
+                                           });
+
+    ASSERT_TRUE(is_hw_device_virtual(virt_gpu_ep_device->Device()));
+    tmp_env.UnregisterExecutionProviderLibrary(registration_name.c_str());
+  };
+
+  EXPECT_NO_FATAL_FAILURE(run_test());
+  ortenv_setup();  // Restore OrtEnv
+}
 }  // namespace test
 }  // namespace onnxruntime
-
-#endif  // _WIN32

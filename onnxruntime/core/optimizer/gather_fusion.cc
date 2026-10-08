@@ -28,6 +28,8 @@ static bool GetScalarInt64Initializer(const Graph& graph, const NodeArg& node_ar
   const ONNX_NAMESPACE::TensorProto* tensor_proto = graph_utils::GetConstantInitializer(graph, node_arg.Name());
   if (!tensor_proto || tensor_proto->data_type() != ONNX_NAMESPACE::TensorProto::INT64) return false;
   Initializer init_const{graph, *tensor_proto, graph.ModelPath()};
+  // The NodeArg shape is the inferred type and need not agree with the dims on the initializer.
+  if (init_const.size() < 1) return false;
   value = *(init_const.data<int64_t>());
   rank = tensor_proto->dims_size();
   return true;
@@ -197,6 +199,11 @@ Status GatherSliceToSplitFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     if (condidate_consumers.size() < 2) continue;
     int64_t axis = 0;
     if (!GetAxis(graph, *condidate_consumers[0], rank, axis)) continue;
+    // The 'axis' attribute/input read above comes from the consumer node as declared in the model and is
+    // only range-checked against this node_arg's rank here, not by ONNX shape inference (which may have
+    // skipped its own axis check if it lacked one of the input shapes needed to run it). Reject anything
+    // outside the valid dimension range before indexing 'shape' with it.
+    if (axis < 0 || axis >= rank) continue;
     auto dim = shape->dim(static_cast<int>(axis));
     if (!utils::HasDimValue(dim)) continue;
     int64_t dim_size = dim.dim_value();
@@ -256,7 +263,7 @@ Status GatherSliceToSplitFusion::ApplyImpl(Graph& graph, bool& modified, int gra
         axes_initializer_proto.add_dims(static_cast<int64_t>(1));
         axes_initializer_proto.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT64);
         axes_initializer_proto.add_int64_data(axis);
-        NodeArg* axes_arg = &graph_utils::AddInitializer(graph, axes_initializer_proto);
+        NodeArg* axes_arg = &graph_utils::AddInitializerWithOrtValue(graph, axes_initializer_proto);
         Node& squeeze_node =
             graph.AddNode(graph.GenerateNodeName("Squeeze"), "Squeeze", "Squeeze for Fused Gather nodes",
                           {split_output_arg, axes_arg}, {original_output_arg});
@@ -272,17 +279,21 @@ Status GatherSliceToSplitFusion::ApplyImpl(Graph& graph, bool& modified, int gra
     split_initializer_proto.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT64);
     split_initializer_proto.add_dims(static_cast<int64_t>(split_values.size()));
     split_initializer_proto.mutable_int64_data()->Add(split_values.begin(), split_values.end());
-    NodeArg* split_initializer_arg = &graph_utils::AddInitializer(graph, split_initializer_proto);
+    NodeArg* split_initializer_arg = &graph_utils::AddInitializerWithOrtValue(graph, split_initializer_proto);
     const auto split_node_name = graph.GenerateNodeName(nodes_to_fuse[0].get().Name() + "/GatherSliceToSplitFusion");
     Node& split_node = graph.AddNode(split_node_name, "Split", "Split for Fused Gather nodes",
                                      {graph.GetNodeArg(node_arg->Name()), split_initializer_arg}, split_outputs);
     split_node.AddAttribute("axis", axis);
     split_node.SetExecutionProviderType(nodes_to_fuse[0].get().GetExecutionProviderType());
 
+    InlinedVector<NodeIndex> source_node_indices;
+    source_node_indices.reserve(nodes_to_fuse.size());
     for (Node& node : nodes_to_fuse) {
+      source_node_indices.push_back(node.Index());
       graph_utils::RemoveNodeOutputEdges(graph, node);
       graph.RemoveNode(node.Index());
     }
+    graph.NotifyNodeReplacement(source_node_indices, split_node.Index());
 
     modified = true;
   }
@@ -306,8 +317,9 @@ Status GatherToSliceFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
 
     ORT_RETURN_IF_ERROR(Recurse(node, modified, graph_level, logger));
 
-    if (!graph_utils::IsSupportedOptypeVersionAndDomain(node, "Range", {1, 11}) ||
-        !graph_utils::IsSupportedProvider(node, GetCompatibleExecutionProviders()) || node.GetOutputEdgesCount() != 1) {
+    if (!graph_utils::IsSupportedOptypeVersionAndDomain(node, "Range", {11, 27}) ||
+        !graph_utils::IsSupportedProvider(node, GetCompatibleExecutionProviders()) || node.GetOutputEdgesCount() != 1 ||
+        graph.NodeProducesGraphOutput(node)) {
       continue;
     }
 
@@ -359,7 +371,7 @@ Status GatherToSliceFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
       unsqueeze_axes_initializer_proto.add_dims(static_cast<int64_t>(1));
       unsqueeze_axes_initializer_proto.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT64);
       unsqueeze_axes_initializer_proto.add_int64_data(static_cast<int64_t>(0));
-      NodeArg* unsqueeze_axes_arg = &graph_utils::AddInitializer(graph, unsqueeze_axes_initializer_proto);
+      NodeArg* unsqueeze_axes_arg = &graph_utils::AddInitializerWithOrtValue(graph, unsqueeze_axes_initializer_proto);
 
       for (size_t i = 0; i < range_input_defs.size(); ++i) {
         Node& unsqueeze_node = graph.AddNode(graph.GenerateNodeName("Unsqueeze_" + std::to_string(i)), "Unsqueeze",
@@ -386,17 +398,21 @@ Status GatherToSliceFusion::ApplyImpl(Graph& graph, bool& modified, int graph_le
     } else {
       slice_axes_initializer_proto.add_int32_data(static_cast<int32_t>(axis));
     }
-    NodeArg* slice_axes_arg = &graph_utils::AddInitializer(graph, slice_axes_initializer_proto);
+    NodeArg* slice_axes_arg = &graph_utils::AddInitializerWithOrtValue(graph, slice_axes_initializer_proto);
     Node& slice_node = graph.AddNode(graph.GenerateNodeName("Slice"), "Slice", "Slice for Fused Gather nodes",
                                      {gather_node.MutableInputDefs()[0], unsqueeze_outputs[0], unsqueeze_outputs[1],
                                       slice_axes_arg, unsqueeze_outputs[2]},
                                      {gather_node.MutableOutputDefs()[0]});
     slice_node.SetExecutionProviderType(gather_node.GetExecutionProviderType());
 
+    InlinedVector<NodeIndex> source_node_indices;
+    source_node_indices.reserve(nodes_to_fuse.size());
     for (Node& n : nodes_to_fuse) {
+      source_node_indices.push_back(n.Index());
       graph_utils::RemoveNodeOutputEdges(graph, n);
       graph.RemoveNode(n.Index());
     }
+    graph.NotifyNodeReplacement(source_node_indices, slice_node.Index());
 
     modified = true;
   }

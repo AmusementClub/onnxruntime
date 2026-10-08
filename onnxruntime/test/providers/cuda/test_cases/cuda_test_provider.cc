@@ -105,12 +105,17 @@ struct ProviderInfo_CUDA_TestImpl : ProviderInfo_CUDA {
     return nullptr;
   }
 
+  std::shared_ptr<onnxruntime::IAllocator> CreateCudaPinnedAllocator(int16_t, size_t, onnxruntime::ArenaExtendStrategy,
+                                                                     const OrtArenaCfg*) override {
+    return nullptr;
+  }
+
   void TestAll() override {
     // TestAll is the entry point of CUDA EP's internal tests.
-    // Those internal tests are not directly callable from onnxruntime_test_all
+    // Those internal tests are not directly callable from onnxruntime_provider_test
     // because CUDA EP is a shared library now.
     // Instead, this is a test provider that implements all the test cases.
-    // onnxruntime_test_all is calling this function through TryGetProviderInfo_CUDA_Test.
+    // onnxruntime_provider_test is calling this function through TryGetProviderInfo_CUDA_Test.
     char mock_exe_name[] = "onnxruntime_providers_cuda_ut";
 
     // InitGoogleTest decrements argc and removes args from argv if
@@ -122,6 +127,8 @@ struct ProviderInfo_CUDA_TestImpl : ProviderInfo_CUDA {
     // char* argv[] = {mock_exe_name, "--gtest_filter=ReductionFunctionsTest.*", nullptr};
     ::testing::InitGoogleTest(&argc, argv);
     ORT_ENFORCE(RUN_ALL_TESTS() == 0);
+    ORT_ENFORCE(::testing::UnitTest::GetInstance()->successful_test_count() > 0,
+                "CUDA EP internal-test module must execute at least one non-skipped test.");
   }
 };
 ProviderInfo_CUDA_TestImpl g_test_info;
@@ -130,6 +137,7 @@ struct CUDA_Test_Provider : Provider {
   void* GetInfo() override { return &g_test_info; }
 
   void Initialize() override {
+    InitProviderOrtApi();
     InitializeRegistry();
   }
 

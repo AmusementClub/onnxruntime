@@ -4,7 +4,10 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "core/session/onnxruntime_cxx_api.h"
 
@@ -15,23 +18,61 @@ using RegisteredEpDeviceUniquePtr = std::unique_ptr<const OrtEpDevice, std::func
 
 struct Utils {
   struct ExamplePluginInfo {
-    const std::filesystem::path library_path =
-#if _WIN32
-        "example_plugin_ep.dll";
-#else
-        "libexample_plugin_ep.so";
-#endif
-    const std::string registration_name = "example_ep";
+    ExamplePluginInfo(std::filesystem::path lib_path, const char* reg_name, const char* ep_name);
+
+    std::filesystem::path library_path;
+    std::string registration_name;
+    std::string ep_name;
   };
 
-  static ExamplePluginInfo example_ep_info;
+  static const ExamplePluginInfo example_ep_info;                  // example_plugin_ep.dll
+  static const ExamplePluginInfo example_ep_virt_gpu_info;         // example_plugin_ep_virt_gpu.dll
+  static const ExamplePluginInfo example_ep_kernel_registry_info;  // example_plugin_ep_kernel_registry.dll
 
   // get the OrtEpDevice for an arbitrary EP from the environment
   static void GetEp(Ort::Env& env, const std::string& ep_name, const OrtEpDevice*& ep_device);
 
   // Register the example EP library, get the OrtEpDevice for it, and return a unique pointer that will
   // automatically unregister the EP library.
-  static void RegisterAndGetExampleEp(Ort::Env& env, RegisteredEpDeviceUniquePtr& example_ep);
+  static void RegisterAndGetExampleEp(Ort::Env& env, const ExamplePluginInfo& ep_info,
+                                      RegisteredEpDeviceUniquePtr& example_ep);
+
+  struct ExampleEpHooks {
+    using ResetSyncCountFn = void (*)();
+    using GetSyncCountFn = uint64_t (*)();
+    using ResetPreallocatedOutputQueryFn = void (*)();
+    using GetPreallocatedOutputQueryResultFn = int (*)();
+    using GetPreallocatedOutputBadIndexRejectedFn = int (*)();
+    using SetCreateDataTransferFailureFn = void (*)(int enabled);
+
+    ResetSyncCountFn reset_sync_count{};
+    GetSyncCountFn get_sync_count{};
+    ResetPreallocatedOutputQueryFn reset_preallocated_output_query{};
+    GetPreallocatedOutputQueryResultFn get_preallocated_output_query_result{};
+    GetPreallocatedOutputBadIndexRejectedFn get_preallocated_output_bad_index_rejected{};
+    SetCreateDataTransferFailureFn set_create_data_transfer_failure{};
+  };
+
+  using LoadExampleEpHooksPtr = std::unique_ptr<ExampleEpHooks, std::function<void(ExampleEpHooks*)>>;
+
+  static void LoadExampleEpHooks(const Utils::ExamplePluginInfo& ep_info,
+                                 LoadExampleEpHooksPtr& example_ep_hooks);
 };
+
+// Runs the mul_1.onnx inference test with ep_name selected in two ways:
+// - automatically through "test.ep_to_select", when test_auto_select is true.
+// - explicitly through SessionOptionsAppendExecutionProvider_V2.
+// Both paths pass provider_options to the EP: as prefixed session options on the auto-selection path and as
+// ep_options on the V2 path. The V2 path uses the devices chosen by select_devices, or the first OrtEpDevice
+// advertised for ep_name when no selector is provided. If library_path is provided, the helper registers the
+// plugin EP library before creating the session.
+// disable_cpu_ep_fallback applies to both paths. It requires the selected EP to handle the entire graph, preventing
+// a false pass caused by unsupported nodes falling back to the ORT CPU EP.
+void RunBasicTest(const std::string& ep_name, std::optional<std::filesystem::path> library_path,
+                  const Ort::KeyValuePairs& provider_options = Ort::KeyValuePairs{},
+                  const std::function<void(std::vector<const OrtEpDevice*>&)>& select_devices = nullptr,
+                  bool test_auto_select = true,
+                  bool disable_cpu_ep_fallback = false);
+
 }  // namespace test
 }  // namespace onnxruntime

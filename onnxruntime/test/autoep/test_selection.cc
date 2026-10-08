@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-// registration/selection is only supported on windows as there's no device discovery on other platforms
-#ifdef _WIN32
-
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <unordered_set>
 // #include <absl/base/config.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -13,12 +14,15 @@
 #include "core/session/abi_key_value_pairs.h"
 #include "core/session/abi_session_options_impl.h"
 #include "core/session/onnxruntime_cxx_api.h"
+#include "core/session/onnxruntime_ep_device_ep_metadata_keys.h"
+#include "core/session/onnxruntime_session_options_config_keys.h"
 
 #include "test_allocator.h"
 #include "test/autoep/test_autoep_utils.h"
 #include "test/shared_lib/utils.h"
 #include "test/util/include/api_asserts.h"
 #include "test/util/include/asserts.h"
+#include "test/util/include/file_util.h"
 
 extern std::unique_ptr<Ort::Env> ort_env;
 
@@ -35,6 +39,12 @@ void DefaultDeviceSelection(const std::string& ep_name, std::vector<const OrtEpD
   for (size_t i = 0; i < num_devices; ++i) {
     const OrtEpDevice* device = ep_devices[i];
     if (c_api->EpDevice_EpName(device) == ep_name) {
+      const auto* hw_device = c_api->EpDevice_Device(device);
+      const OrtKeyValuePairs* hw_kvps = c_api->HardwareDevice_Metadata(hw_device);
+
+      const char* is_virtual = c_api->GetKeyValue(hw_kvps, kOrtHardwareDevice_MetadataKey_IsVirtual);
+      ASSERT_TRUE(is_virtual == nullptr || strcmp(is_virtual, "0") == 0);
+
       devices.push_back(device);
       break;
     }
@@ -52,6 +62,62 @@ bool IsRegistered(const std::string& ep_name) {
 
   return true;
 }
+
+static OrtStatus* ORT_API_CALL SelectFirstEpByName(_In_ const OrtEpDevice** ep_devices,
+                                                   _In_ size_t num_devices,
+                                                   _In_ const OrtKeyValuePairs* /*model_metadata*/,
+                                                   _In_opt_ const OrtKeyValuePairs* /*runtime_metadata*/,
+                                                   _Inout_ const OrtEpDevice** selected,
+                                                   _In_ size_t max_selected,
+                                                   _Out_ size_t* num_selected,
+                                                   _In_ void* state) {
+  *num_selected = 0;
+
+  if (max_selected == 0) {
+    return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, "Expected room for at least one selected device.");
+  }
+
+  const char* ep_name = static_cast<const char*>(state);
+  for (size_t i = 0; i < num_devices; ++i) {
+    if (std::strcmp(Ort::GetApi().EpDevice_EpName(ep_devices[i]), ep_name) == 0) {
+      selected[0] = ep_devices[i];
+      *num_selected = 1;
+      return nullptr;
+    }
+  }
+
+  return Ort::GetApi().CreateStatus(ORT_FAIL, "Expected duplicate-device test EP to be available.");
+}
+
+#if !defined(ORT_MINIMAL_BUILD)
+Ort::SessionOptions CreateAutoEpOptionsSelecting(const char* ep_name) {
+  Ort::SessionOptions session_options;
+  session_options.SetEpSelectionPolicy(SelectFirstEpByName, const_cast<char*>(ep_name));
+  return session_options;
+}
+
+Ort::Model CreateMulOrtModel() {
+  Ort::Graph graph;
+
+  const std::vector<int64_t> dims{3, 2};
+  Ort::TensorTypeAndShapeInfo tensor_info(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, dims);
+  auto type_info = Ort::TypeInfo::CreateTensorInfo(tensor_info.GetConst());
+
+  std::vector<Ort::ValueInfo> graph_inputs;
+  graph_inputs.emplace_back("X", type_info.GetConst());
+  std::vector<Ort::ValueInfo> graph_outputs;
+  graph_outputs.emplace_back("Y", type_info.GetConst());
+  graph.SetInputs(graph_inputs);
+  graph.SetOutputs(graph_outputs);
+
+  Ort::Node node("Mul", onnxruntime::kOnnxDomain, "mul_node", {"X", "X"}, {"Y"});
+  graph.AddNode(node);
+
+  Ort::Model model({{onnxruntime::kOnnxDomain, 13}});
+  model.AddGraph(graph);
+  return model;
+}
+#endif  // !defined(ORT_MINIMAL_BUILD)
 }  // namespace
 
 template <typename ModelOutputT, typename ModelInputT = float, typename InputT = Input<float>>
@@ -69,8 +135,17 @@ static void TestInference(Ort::Env& env, const std::basic_string<ORTCHAR_T>& mod
                           // auto select using policy
                           std::optional<OrtExecutionProviderDevicePolicy> policy = std::nullopt,
                           std::optional<EpSelectionDelegate> delegate = std::nullopt,
-                          bool test_session_creation_only = false) {
+                          bool test_session_creation_only = false,
+                          // If true, disables fallback of unsupported graph nodes to the ORT CPU
+                          // EP. Session creation fails unless the selected non-CPU EP supports the
+                          // entire graph. Setting this to true while explicitly selecting the ORT
+                          // CPU EP is invalid and causes session creation to fail.
+                          bool disable_cpu_ep_fallback = false) {
   Ort::SessionOptions session_options;
+
+  if (disable_cpu_ep_fallback) {
+    session_options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1");
+  }
 
   if (library_path && IsRegistered(ep_to_select) == false) {
     ASSERT_ORTSTATUS_OK(Ort::GetApi().RegisterExecutionProviderLibrary(env, ep_to_select.c_str(),
@@ -133,10 +208,11 @@ static void TestInference(Ort::Env& env, const std::basic_string<ORTCHAR_T>& mod
   }
 }
 
-namespace {
 void RunBasicTest(const std::string& ep_name, std::optional<std::filesystem::path> library_path,
-                  const Ort::KeyValuePairs& provider_options = Ort::KeyValuePairs{},
-                  const std::function<void(std::vector<const OrtEpDevice*>&)>& select_devices = nullptr) {
+                  const Ort::KeyValuePairs& provider_options,
+                  const std::function<void(std::vector<const OrtEpDevice*>&)>& select_devices,
+                  bool test_auto_select,
+                  bool disable_cpu_ep_fallback) {
   const auto run_test = [&](bool auto_select) {
     std::vector<Input<float>> inputs(1);
     auto& input = inputs.back();
@@ -155,13 +231,19 @@ void RunBasicTest(const std::string& ep_name, std::optional<std::filesystem::pat
                          expected_dims_y,
                          expected_values_y,
                          auto_select,
-                         select_devices);
+                         select_devices,
+                         /*policy*/ std::nullopt,
+                         /*delegate*/ std::nullopt,
+                         /*test_session_creation_only*/ false,
+                         disable_cpu_ep_fallback);
   };
 
-  run_test(true);   // auto ep selection after session creation
+  if (test_auto_select) {
+    run_test(true);  // auto ep selection after session creation
+  }
+
   run_test(false);  // SessionOptionsAppendExecutionProvider_V2
 }
-}  // namespace
 
 TEST(AutoEpSelection, CpuEP) {
   RunBasicTest(kCpuExecutionProvider, std::nullopt);
@@ -171,7 +253,9 @@ TEST(AutoEpSelection, CpuEP) {
 TEST(AutoEpSelection, CudaEP) {
   Ort::KeyValuePairs provider_options;
   provider_options.Add("prefer_nhwc", "1");
-  RunBasicTest(kCudaExecutionProvider, "onnxruntime_providers_cuda", provider_options);
+  const auto cuda_ep_lib_path =
+      std::filesystem::path{GetSharedLibraryFileName(ORT_TSTR("onnxruntime_providers_cuda"))};
+  RunBasicTest(kCudaExecutionProvider, cuda_ep_lib_path, provider_options);
 }
 #endif
 
@@ -193,6 +277,9 @@ TEST(AutoEpSelection, DmlEP) {
         const auto* device = c_api->EpDevice_Device(ep_device);
         const OrtKeyValuePairs* kvps = c_api->HardwareDevice_Metadata(device);
 
+        const char* is_virtual = c_api->GetKeyValue(kvps, kOrtHardwareDevice_MetadataKey_IsVirtual);
+        ASSERT_TRUE(is_virtual == nullptr || strcmp(is_virtual, "0") == 0);
+
         if (devices.empty()) {
           // add the first device
           devices.push_back(ep_device);
@@ -213,11 +300,11 @@ TEST(AutoEpSelection, DmlEP) {
 }
 #endif
 
-#if defined(USE_WEBGPU)
+#if defined(USE_WEBGPU) && !defined(ORT_USE_EP_API_ADAPTERS)
 TEST(AutoEpSelection, WebGpuEP) {
   RunBasicTest(kWebGpuExecutionProvider, std::nullopt);
 }
-#endif
+#endif  // defined(USE_WEBGPU) && !defined(ORT_USE_EP_API_ADAPTERS)
 
 // tests for AutoEP selection related things in the API that aren't covered by the other tests.
 TEST(AutoEpSelection, MiscApiTests) {
@@ -355,6 +442,64 @@ TEST(AutoEpSelection, PreferNpu) {
                        /*select_devices*/ nullptr,
                        OrtExecutionProviderDevicePolicy::OrtExecutionProviderDevicePolicy_PREFER_NPU);
 }
+
+#if !defined(ORT_MINIMAL_BUILD)
+TEST(AutoEpSelection, DuplicateEpCustomOpDomainsAreDeduplicatedForSessionCreation) {
+  constexpr const char* duplicate_ep_name = "example_ep_duplicate_devices";
+  const Utils::ExamplePluginInfo duplicate_ep_info{
+      GetSharedLibraryFileName(ORT_TSTR("example_plugin_ep")),
+      duplicate_ep_name,
+      duplicate_ep_name};
+  RegisteredEpDeviceUniquePtr duplicate_ep;
+  ASSERT_NO_FATAL_FAILURE(Utils::RegisterAndGetExampleEp(*ort_env, duplicate_ep_info, duplicate_ep));
+
+  const OrtApi& c_api = Ort::GetApi();
+  const OrtEpDevice* const* ep_devices = nullptr;
+  size_t num_ep_devices = 0;
+  ASSERT_ORTSTATUS_OK(c_api.GetEpDevices(*ort_env, &ep_devices, &num_ep_devices));
+
+  size_t num_duplicate_ep_devices = 0;
+  std::unordered_set<uint32_t> duplicate_device_ids;
+  // Verify the regression hook created two EP devices for distinct hardware devices, rather than duplicating one
+  // device. Both are backed by the same factory and thus return identical custom-op domains.
+  for (size_t i = 0; i < num_ep_devices; ++i) {
+    if (std::strcmp(c_api.EpDevice_EpName(ep_devices[i]), duplicate_ep_name) == 0) {
+      ++num_duplicate_ep_devices;
+      const OrtHardwareDevice* hardware_device = c_api.EpDevice_Device(ep_devices[i]);
+      ASSERT_EQ(c_api.HardwareDevice_Type(hardware_device), OrtHardwareDeviceType::OrtHardwareDeviceType_CPU);
+      const char* is_virtual = c_api.GetKeyValue(c_api.HardwareDevice_Metadata(hardware_device),
+                                                 kOrtHardwareDevice_MetadataKey_IsVirtual);
+      ASSERT_STREQ(is_virtual, "1");
+      duplicate_device_ids.insert(c_api.HardwareDevice_DeviceId(hardware_device));
+    }
+  }
+  ASSERT_EQ(num_duplicate_ep_devices, size_t{2});
+  ASSERT_EQ(duplicate_device_ids.size(), size_t{2});
+
+  const std::filesystem::path custom_op_model_path{ORT_TSTR("testdata/custom_mul.onnx")};
+
+  {
+    Ort::SessionOptions session_options = CreateAutoEpOptionsSelecting(duplicate_ep_name);
+    Ort::Session session(*ort_env, custom_op_model_path.c_str(), session_options);
+  }
+
+  {
+    std::ifstream model_file(ORT_TSTR("testdata/mul_1.onnx"), std::ios::binary);
+    ASSERT_TRUE(model_file.good());
+    std::vector<char> model_data((std::istreambuf_iterator<char>(model_file)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(model_data.empty());
+
+    Ort::SessionOptions session_options = CreateAutoEpOptionsSelecting(duplicate_ep_name);
+    Ort::Session session(*ort_env, model_data.data(), model_data.size(), session_options);
+  }
+
+  {
+    Ort::Model model = CreateMulOrtModel();
+    Ort::SessionOptions session_options = CreateAutoEpOptionsSelecting(duplicate_ep_name);
+    Ort::Session session(*ort_env, model, session_options);
+  }
+}
+#endif  // !defined(ORT_MINIMAL_BUILD)
 
 static OrtStatus* ORT_API_CALL PolicyDelegate(_In_ const OrtEpDevice** ep_devices,
                                               _In_ size_t num_devices,
@@ -502,5 +647,3 @@ TEST(AutoEpSelection, PolicyDelegateReturnsError) {
 
 }  // namespace test
 }  // namespace onnxruntime
-
-#endif  // _WIN32

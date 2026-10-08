@@ -13,7 +13,6 @@ from pathlib import Path
 import onnx
 
 import onnxruntime
-from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
 from onnxruntime.transformers.onnx_utils import extract_raw_data_from_model, has_external_data
 
 from .fusions import ReplaceUpsampleWithResize
@@ -74,51 +73,56 @@ def quant_pre_process(
 
     with tempfile.TemporaryDirectory(prefix="pre.quant.") as quant_tmp_dir:
         temp_path = Path(quant_tmp_dir)
-        model = None
+        model = input_model if isinstance(input_model, onnx.ModelProto) else onnx.load(input_model)
+        model_updated = False
+
+        # Since Upsample is deprecated after opset v10, and the model's opset will
+        # be upgraded to at least v11 during quantization, we need to replace Upsample
+        # with Resize first to avoid generating an invalid model.
+        ai_onnx_domain = [opset for opset in model.opset_import if not opset.domain or opset.domain == "ai.onnx"]
+        if len(ai_onnx_domain) == 1:
+            opset_version = ai_onnx_domain[0].version
+            if opset_version <= 10:
+                ReplaceUpsampleWithResize(ONNXModel(model), opset_version).apply()
+                model = onnx.version_converter.convert_version(model, 11)
+                model = save_and_reload_model_with_shape_infer(model)
+                model_updated = True
 
         if not skip_symbolic_shape:
+            try:
+                from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference  # noqa: PLC0415
+            except ImportError as e:
+                raise ImportError(
+                    "sympy is required for symbolic shape inference in quantization preprocessing. "
+                    "Install with: 'pip install sympy' or pass skip_symbolic_shape=True to quant_pre_process()."
+                ) from e
             logger.info("Performing symbolic shape inference...")
-            loaded_model = input_model if isinstance(input_model, onnx.ModelProto) else onnx.load(input_model)
             model = SymbolicShapeInference.infer_shapes(
-                loaded_model,
+                model,
                 int_max,
                 auto_merge,
                 guess_output_rank,
                 verbose,
             )
-
-        # Since Upsample is deprecated after opset v10, and the model's opset will
-        # be upgraded to at least v11 during quantization, we need to replace Upsample
-        # with Resize first to avoid generating an invalid model.
-        if model:
-            ai_onnx_domain = [opset for opset in model.opset_import if not opset.domain or opset.domain == "ai.onnx"]
-            if len(ai_onnx_domain) == 1:
-                opset_version = ai_onnx_domain[0].version
-                if opset_version < 10:
-                    ReplaceUpsampleWithResize(ONNXModel(model), opset_version).apply()
-                    model.opset_import.remove(ai_onnx_domain[0])
-                    opset_version = 11
-                    model.opset_import.extend([onnx.helper.make_opsetid("", opset_version)])
-                    model = onnx.version_converter.convert_version(model, opset_version)
-                    model = save_and_reload_model_with_shape_infer(model)
+            model_updated = True
 
         if not skip_optimization:
             # Use ORT optimizers (native code) to optimize model
-            if not skip_symbolic_shape:
-                # Need to save the inferenced model to file so as to run the optimizer
-                input_model = str(temp_path / "symbolic_shape_inferred.onnx")
+            optimization_input_model = input_model
+            if model_updated:
+                # Save any converted or shape-inferred model before running the optimizer.
+                optimization_input_model = str(temp_path / "preprocessed.onnx")
                 if save_as_external_data:
                     onnx.save_model(
                         model,
-                        input_model,
+                        optimization_input_model,
                         save_as_external_data=True,
                         all_tensors_to_one_file=all_tensors_to_one_file,
                         size_threshold=external_data_size_threshold,
                         convert_attribute=False,
                     )
                 else:
-                    onnx.save(model, input_model)
-                model = None
+                    onnx.save(model, optimization_input_model)
 
             opt_model_path = str(temp_path / "optimized.onnx")
             try:
@@ -126,16 +130,16 @@ def quant_pre_process(
                 sess_option.optimized_model_filepath = opt_model_path
                 sess_option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_BASIC
                 # For large model, extract external data from model and add to session options
-                if isinstance(input_model, onnx.ModelProto):
-                    if has_external_data(input_model):
+                if isinstance(optimization_input_model, onnx.ModelProto):
+                    if has_external_data(optimization_input_model):
                         raise ValueError(
                             "ModelProto has external data not loaded into memory, ORT cannot create session. "
                             "Please load external data before calling this function. "
                             "See https://onnx.ai/onnx/repo-docs/ExternalData.html for more information."
                         )
-                    external_names, external_values = extract_raw_data_from_model(input_model)
+                    external_names, external_values = extract_raw_data_from_model(optimization_input_model)
                     sess_option.add_external_initializers(list(external_names), list(external_values))
-                    input_model = input_model.SerializeToString()
+                    optimization_input_model = optimization_input_model.SerializeToString()
                 # the saved optimized model otherwise points to the original external data file name
                 # which is not available relative to the optimized model file
                 elif skip_symbolic_shape and save_as_external_data:
@@ -143,17 +147,23 @@ def quant_pre_process(
                         "session.optimized_model_external_initializers_file_name", "optimized.onnx.data"
                     )
 
-                sess = onnxruntime.InferenceSession(input_model, sess_option, providers=["CPUExecutionProvider"])
+                sess = onnxruntime.InferenceSession(
+                    optimization_input_model, sess_option, providers=["CPUExecutionProvider"]
+                )
                 # Close the session to avoid the cleanup error on Windows for temp folders
                 # https://github.com/microsoft/onnxruntime/issues/17627
                 del sess
+                if skip_onnx_shape:
+                    # Load before the temporary optimizer output is removed.
+                    model = onnx.load(opt_model_path)
+                else:
+                    model = None
+                    input_model = opt_model_path
             except Exception:
                 logger.error(
                     "ONNX Runtime Model Optimization Failed! Consider rerun with option `--skip_optimization'."
                 )
                 logger.error(traceback.format_exc())
-
-            input_model = opt_model_path
 
         if not skip_onnx_shape:
             # ONNX shape inference.
@@ -190,8 +200,8 @@ def quant_pre_process(
             onnx.shape_inference.infer_shapes_path(input_model, inferred_model_path)
             model = onnx.load(inferred_model_path)
 
-    if model is None:
-        model = input_model if isinstance(input_model, onnx.ModelProto) else onnx.load(input_model)
+        if model is None:
+            model = input_model if isinstance(input_model, onnx.ModelProto) else onnx.load(input_model)
 
     add_pre_process_metadata(model)
 
