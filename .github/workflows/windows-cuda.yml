@@ -12,11 +12,11 @@ jobs:
 
     steps:
     - name: Checkout repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
         # master
-        ref: 4754a1d64e5920a715b0396906f339e6c15742a0
+        ref: ce9bb0817e55e8e42e46c8736a8dc436a15f627e
         fetch-depth: 0
 
     - name: Fix
@@ -31,20 +31,20 @@ jobs:
 
     - name: Cache CUDA
       id: cache-cuda
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-        key: ${{ runner.os }}-cuda-13.0.1
+        key: ${{ runner.os }}-cuda-13.4.2
 
     - name: Setup CUDA
       if: steps.cache-cuda.outputs.cache-hit != 'true'
       run: |
-        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/13.0.1/network_installers/cuda_13.0.1_windows_network.exe
-        cuda_installer.exe -s nvcc_13.0 cudart_13.0 cublas_dev_13.0 cufft_dev_13.0 curand_dev_13.0 cusparse_dev_13.0 cupti_13.0 thrust_13.0 nvtx_13.0 crt_13.0 nvptxcompiler_13.0 nvvm_13.0
+        curl -s -o cuda_installer.exe -L https://developer.download.nvidia.com/compute/cuda/13.4.2/network_installers/cuda_13.4.2_windows_x86_64_network.exe
+        cuda_installer.exe -s nvcc_13.4 cudart_13.4 cublas_dev_13.4 cufft_dev_13.4 curand_dev_13.4 cusparse_dev_13.4 cupti_13.4 thrust_13.4 nvtx_13.4 crt_13.4 nvptxcompiler_13.4 nvvm_13.4
 
     - name: Download cuDNN inference library
       run: |
-        curl -LJ https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.13.0.50_cuda13-archive.zip -o cudnn.zip
+        curl -LJ https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.26.1.1_cuda13-archive.zip -o cudnn.zip
         unzip cudnn.zip
         mkdir -p cudnn
         cp -r cudnn-windows-*/include cudnn/ -v
@@ -65,11 +65,11 @@ jobs:
         -D onnxruntime_ENABLE_NVTX_PROFILE=OFF
         -D onnxruntime_USE_DML=ON
         -D CMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real"
-        -D CMAKE_CUDA_COMPILER="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\nvcc.exe"
+        -D CMAKE_CUDA_COMPILER="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\nvcc.exe"
         -D CMAKE_CUDA_FLAGS="-D__NV_NO_VECTOR_DEPRECATION_DIAG --compress-mode=size"
         -D onnxruntime_DISABLE_FLOAT4_TYPES=ON
       env:
-        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
+        CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4
 
     - name: Build
       run: cmake --build build --verbose
@@ -81,7 +81,7 @@ jobs:
       run: ls -R onnxruntime-gpu
 
     - name: Upload
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: onnxruntime-windows-cuda
         retention-days: 1
